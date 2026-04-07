@@ -150,7 +150,14 @@ const getMe = async (req, res) => {
 const savePushToken = async (req, res, next) => {
   try {
     const token = String(req.body?.token || req.body?.pushToken || "").trim();
+    const userId = req.user?._id?.toString?.() || "(missing-user-id)";
+    console.log("[push] savePushToken received raw token:", token);
+    console.log("[push] savePushToken received userId:", userId);
+
     if (!isExpoPushToken(token)) {
+      console.warn(
+        "[push] savePushToken rejected token format; expected prefix ExponentPushToken[",
+      );
       throw createHttpError(400, "Invalid push token");
     }
 
@@ -159,8 +166,35 @@ const savePushToken = async (req, res, next) => {
       { $addToSet: { expoPushTokens: token } },
     );
 
-    console.log("[push] saved token", token, "for", req.user._id.toString());
+    const refreshedUser = await User.findById(req.user._id)
+      .select("expoPushTokens")
+      .lean();
+    console.log(
+      "[push] saved token",
+      token,
+      "for",
+      userId,
+      "current expoPushTokens:",
+      refreshedUser?.expoPushTokens || [],
+    );
     return res.status(200).json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getMyPushTokensDebug = async (req, res, next) => {
+  try {
+    const userId = req.user?._id?.toString?.() || "(missing-user-id)";
+    const expoPushTokens = Array.isArray(req.user?.expoPushTokens)
+      ? req.user.expoPushTokens
+      : [];
+    console.log("[push] debug my-tokens requested by userId:", userId);
+    console.log("[push] debug my-tokens value:", expoPushTokens);
+    return res.status(200).json({
+      userId,
+      expoPushTokens,
+    });
   } catch (error) {
     return next(error);
   }
@@ -791,6 +825,7 @@ module.exports = {
   login,
   getMe,
   savePushToken,
+  getMyPushTokensDebug,
   updateProfile,
   changePassword,
   deleteAccount,

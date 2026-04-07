@@ -7,6 +7,7 @@ const path = require("path");
 const { env } = require("./config/env");
 const adminRoutes = require("./routes/adminRoutes");
 const authRoutes = require("./routes/authRoutes");
+const debugRoutes = require("./routes/debugRoutes");
 const healthRoutes = require("./routes/healthRoutes");
 const postRoutes = require("./routes/postRoutes");
 const storyRoutes = require("./routes/storyRoutes");
@@ -69,6 +70,7 @@ app.get("/posts/:postId", (req, res) => {
 app.use("/health", healthRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/auth", authRoutes);
+app.use("/api/debug", debugRoutes);
 app.use("/api/posts", postRoutes);
 app.use("/api/stories", storyRoutes);
 app.use("/api/messages", messageRoutes);

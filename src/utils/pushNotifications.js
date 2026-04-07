@@ -1,11 +1,8 @@
 const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
+const EXPECTED_PUSH_TOKEN_PREFIX = "ExponentPushToken[";
 
 const isExpoPushToken = (token) => {
-  return (
-    typeof token === "string" &&
-    (token.startsWith("ExponentPushToken[") ||
-      token.startsWith("ExpoPushToken["))
-  );
+  return typeof token === "string" && token.startsWith(EXPECTED_PUSH_TOKEN_PREFIX);
 };
 
 const sendExpoPushNotifications = async ({
@@ -20,7 +17,9 @@ const sendExpoPushNotifications = async ({
     return;
   }
 
+  console.log("[push] raw tokens before validation:", tokens || []);
   const validTokens = Array.from(new Set((tokens || []).filter(isExpoPushToken)));
+  console.log("[push] validTokens after validation:", validTokens);
   if (validTokens.length === 0) {
     console.warn("[push] no valid expo tokens found");
     return;
@@ -52,6 +51,9 @@ const sendExpoPushNotifications = async ({
     const payload = await response
       .json()
       .catch(() => null);
+
+    console.log("[push] Expo API response status:", response.status);
+    console.log("[push] Expo API response payload:", payload);
 
     if (!response.ok) {
       console.warn("[push] Expo push request failed:", payload || response.status);
