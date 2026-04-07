@@ -324,6 +324,8 @@ const sendAdminNotification = async (req, res, next) => {
 
     await Promise.all(
       users.map((user) =>
+        console.log('[DM] Receiver push tokens:', otherUser.expoPushTokens);
+console.log('[DM] Receiver ID:', otherUserId);
         createUserNotification({
           userId: user._id,
           type: "admin_broadcast",
