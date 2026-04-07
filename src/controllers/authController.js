@@ -159,6 +159,7 @@ const savePushToken = async (req, res, next) => {
       { $addToSet: { expoPushTokens: token } },
     );
 
+    console.log("[push] saved token", token, "for", req.user._id.toString());
     return res.status(200).json({ ok: true });
   } catch (error) {
     return next(error);

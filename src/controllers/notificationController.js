@@ -1,5 +1,6 @@
 const Notification = require("../models/Notification");
 const { createHttpError } = require("../utils/httpError");
+const { sendExpoPushNotifications } = require("../utils/pushNotifications");
 
 const ACTIVITY_NOTIFICATION_TYPES = [
   "post_like",
@@ -77,8 +78,29 @@ const markAllNotificationsRead = async (req, res, next) => {
   }
 };
 
+const sendTestPush = async (req, res, next) => {
+  try {
+    const tokens = Array.isArray(req.user.expoPushTokens)
+      ? req.user.expoPushTokens
+      : [];
+
+    await sendExpoPushNotifications({
+      tokens,
+      title: "Connect test",
+      body: "Push test from server",
+      data: { type: "push_test" },
+      channelId: "messages",
+    });
+
+    return res.status(200).json({ ok: true, tokens: tokens.length });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   listNotifications,
   markNotificationRead,
   markAllNotificationsRead,
+  sendTestPush,
 };

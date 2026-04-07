@@ -22,9 +22,11 @@ const sendExpoPushNotifications = async ({
 
   const validTokens = Array.from(new Set((tokens || []).filter(isExpoPushToken)));
   if (validTokens.length === 0) {
+    console.warn("[push] no valid expo tokens found");
     return;
   }
 
+  console.log("[push] sending", validTokens.length, "notification(s)");
   const messages = validTokens.map((to) => ({
     to,
     sound: "default",

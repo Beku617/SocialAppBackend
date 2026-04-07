@@ -183,6 +183,14 @@ const sendMessage = async (req, res, next) => {
     });
 
     try {
+      console.log(
+        "[dm] push tokens for receiver",
+        otherUserId,
+        "count",
+        Array.isArray(otherUser.expoPushTokens)
+          ? otherUser.expoPushTokens.length
+          : 0,
+      );
       await createUserNotification({
         userId: otherUserId,
         type: "dm",
