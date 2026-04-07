@@ -18,7 +18,12 @@ const sendExpoPushNotifications = async ({
   }
 
   console.log("[push] raw tokens before validation:", tokens || []);
-  const validTokens = Array.from(new Set((tokens || []).filter(isExpoPushToken)));
+  const uniqueTokens = Array.from(new Set(tokens || []));
+  const invalidTokens = uniqueTokens.filter((token) => !isExpoPushToken(token));
+  if (invalidTokens.length > 0) {
+    console.warn("[push] invalid tokens filtered out:", invalidTokens);
+  }
+  const validTokens = uniqueTokens.filter(isExpoPushToken);
   console.log("[push] validTokens after validation:", validTokens);
   if (validTokens.length === 0) {
     console.warn("[push] no valid expo tokens found");
@@ -48,11 +53,19 @@ const sendExpoPushNotifications = async ({
       body: JSON.stringify(messages),
     });
 
-    const payload = await response
-      .json()
-      .catch(() => null);
+    const rawResponse = await response.text();
+    let payload = null;
+    try {
+      payload = rawResponse ? JSON.parse(rawResponse) : null;
+    } catch (parseError) {
+      console.warn(
+        "[push] failed to parse Expo API response JSON:",
+        parseError,
+      );
+    }
 
     console.log("[push] Expo API response status:", response.status);
+    console.log("[push] Expo API raw response:", rawResponse);
     console.log("[push] Expo API response payload:", payload);
 
     if (!response.ok) {

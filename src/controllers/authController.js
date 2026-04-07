@@ -153,6 +153,10 @@ const savePushToken = async (req, res, next) => {
     const userId = req.user?._id?.toString?.() || "(missing-user-id)";
     console.log("[push] savePushToken received raw token:", token);
     console.log("[push] savePushToken received userId:", userId);
+    console.log(
+      "[push] savePushToken existing req.user.expoPushTokens:",
+      req.user?.expoPushTokens || [],
+    );
 
     if (!isExpoPushToken(token)) {
       console.warn(
