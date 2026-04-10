@@ -84,7 +84,7 @@ const sendTestPush = async (req, res, next) => {
       ? req.user.expoPushTokens
       : [];
 
-    await sendExpoPushNotifications({
+    const pushResult = await sendExpoPushNotifications({
       tokens,
       title: "Connect test",
       body: "Push test from server",
@@ -92,7 +92,11 @@ const sendTestPush = async (req, res, next) => {
       channelId: "messages",
     });
 
-    return res.status(200).json({ ok: true, tokens: tokens.length });
+    return res.status(200).json({
+      ok: true,
+      tokens: tokens.length,
+      push: pushResult,
+    });
   } catch (error) {
     return next(error);
   }

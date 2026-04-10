@@ -5,16 +5,39 @@ const isExpoPushToken = (token) => {
   return typeof token === "string" && token.startsWith(EXPECTED_PUSH_TOKEN_PREFIX);
 };
 
+const collectInvalidTokensFromTickets = (tickets, validTokens) => {
+  if (!Array.isArray(tickets) || !Array.isArray(validTokens)) {
+    return [];
+  }
+
+  return tickets
+    .map((ticket, index) => {
+      const detailsError = ticket?.details?.error;
+      if (detailsError === "DeviceNotRegistered") {
+        return validTokens[index];
+      }
+      return null;
+    })
+    .filter(Boolean);
+};
+
 const sendExpoPushNotifications = async ({
   tokens,
   title,
   body,
   data = {},
   channelId = "messages",
+  badge,
 }) => {
+  const result = {
+    attempted: 0,
+    accepted: 0,
+    invalidTokens: [],
+  };
+
   if (typeof fetch !== "function") {
     console.warn("[push] fetch is unavailable in this Node runtime");
-    return;
+    return result;
   }
 
   console.log("[push] raw tokens before validation:", tokens || []);
@@ -27,8 +50,9 @@ const sendExpoPushNotifications = async ({
   console.log("[push] validTokens after validation:", validTokens);
   if (validTokens.length === 0) {
     console.warn("[push] no valid expo tokens found");
-    return;
+    return result;
   }
+  result.attempted = validTokens.length;
 
   console.log("[push] sending", validTokens.length, "notification(s)");
   const messages = validTokens.map((to) => ({
@@ -40,6 +64,9 @@ const sendExpoPushNotifications = async ({
     title,
     body,
     data,
+    ...(Number.isFinite(badge)
+      ? { badge: Math.max(0, Math.floor(badge)) }
+      : {}),
   }));
 
   try {
@@ -70,10 +97,12 @@ const sendExpoPushNotifications = async ({
 
     if (!response.ok) {
       console.warn("[push] Expo push request failed:", payload || response.status);
-      return;
+      return result;
     }
 
     const tickets = Array.isArray(payload?.data) ? payload.data : [];
+    result.accepted = tickets.filter((ticket) => ticket?.status === "ok").length;
+    result.invalidTokens = collectInvalidTokensFromTickets(tickets, validTokens);
     const errored = tickets
       .map((ticket, index) => ({ ticket, index }))
       .filter(({ ticket }) => ticket?.status !== "ok");
@@ -91,12 +120,14 @@ const sendExpoPushNotifications = async ({
           details,
         );
       });
-      return;
+      return result;
     }
 
     console.log("[push] Expo accepted all notifications");
+    return result;
   } catch (error) {
     console.warn("[push] Expo push request error:", error);
+    return result;
   }
 };
 

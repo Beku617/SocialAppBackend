@@ -1,4 +1,5 @@
 const Notification = require("../models/Notification");
+const User = require("../models/User");
 const { sendExpoPushNotifications } = require("./pushNotifications");
 
 const createUserNotification = async ({
@@ -19,7 +20,12 @@ const createUserNotification = async ({
   });
 
   if (push.enabled) {
-    await sendExpoPushNotifications({
+    const unreadCount = await Notification.countDocuments({
+      user: userId,
+      read: false,
+    });
+
+    const pushResult = await sendExpoPushNotifications({
       tokens: push.tokens || [],
       title,
       body,
@@ -29,7 +35,24 @@ const createUserNotification = async ({
         notificationId: notification._id.toString(),
       },
       channelId: push.channelId || "messages",
+      badge: unreadCount,
     });
+
+    const invalidTokens = Array.isArray(pushResult?.invalidTokens)
+      ? pushResult.invalidTokens
+      : [];
+
+    if (invalidTokens.length > 0) {
+      await User.updateOne(
+        { _id: userId },
+        { $pull: { expoPushTokens: { $in: invalidTokens } } },
+      );
+      console.log(
+        "[push] removed invalid Expo push tokens for user",
+        String(userId),
+        invalidTokens,
+      );
+    }
   }
 
   return notification;
