@@ -1,5 +1,6 @@
 const express = require("express");
 const { body, param, query } = require("express-validator");
+const multer = require("multer");
 const {
   completeUpload,
   deleteReel,
@@ -21,6 +22,10 @@ const { requireAuth } = require("../middlewares/auth");
 const { validateRequest } = require("../utils/validateRequest");
 
 const router = express.Router();
+const reelVideoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 40 * 1024 * 1024 },
+});
 
 router.get(
   "/",
@@ -92,12 +97,19 @@ router.post(
 router.post(
   "/:reelId/uploads/local",
   requireAuth,
+  reelVideoUpload.single("video"),
   [
     param("reelId").isMongoId().withMessage("Invalid reel id"),
-    body("base64Data")
-      .isString()
-      .isLength({ min: 100 })
-      .withMessage("base64Data is required"),
+    body().custom((_, { req }) => {
+      const hasMultipartVideo = Boolean(req.file?.buffer?.length);
+      const base64Data = typeof req.body?.base64Data === "string"
+        ? req.body.base64Data.trim()
+        : "";
+      if (!hasMultipartVideo && base64Data.length < 100) {
+        throw new Error("Provide either multipart video file or base64Data");
+      }
+      return true;
+    }),
     body("mimeType")
       .optional({ values: "falsy" })
       .isString()

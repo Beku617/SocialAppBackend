@@ -1,15 +1,15 @@
 const path = require("path");
-const fs = require("fs/promises");
 const mongoose = require("mongoose");
 const Reel = require("../models/Reel");
 const ReelReport = require("../models/ReelReport");
 const User = require("../models/User");
 const { createHttpError } = require("../utils/httpError");
 const { createUserNotification } = require("../utils/notificationCenter");
+const cloudinary = require("../config/cloudinary");
+const { env } = require("../config/env");
 
 const ALLOWED_VISIBILITY = ["public", "friends", "followers", "private"];
 const LOCAL_REEL_UPLOAD_LIMIT_BYTES = 40 * 1024 * 1024; // 40MB
-const UPLOADS_ROOT = path.join(__dirname, "../../uploads");
 
 const DEMO_REELS = [
   {
@@ -201,6 +201,63 @@ const buildUploadUrl = (storageKey) => {
   const template = process.env.REELS_UPLOAD_URL_TEMPLATE || "";
   if (!template) return "";
   return template.replace("{storageKey}", encodeURIComponent(storageKey));
+};
+
+const isCloudinaryConfigured = () =>
+  Boolean(
+    env.CLOUDINARY_CLOUD_NAME &&
+      env.CLOUDINARY_API_KEY &&
+      env.CLOUDINARY_API_SECRET,
+  );
+
+const uploadVideoBufferToCloudinary = async ({
+  buffer,
+  mimeType,
+  userId,
+  reelId,
+}) => {
+  if (!isCloudinaryConfigured()) {
+    throw createHttpError(
+      500,
+      "Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.",
+    );
+  }
+
+  const publicId = `${userId}/${reelId}/original`;
+  const formatFromMime =
+    typeof mimeType === "string" && mimeType.includes("/")
+      ? mimeType.split("/")[1].toLowerCase()
+      : "";
+
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: "video",
+        folder: "reels",
+        public_id: publicId,
+        overwrite: true,
+        quality: "auto",
+        fetch_format: "auto",
+        ...(formatFromMime ? { format: formatFromMime } : {}),
+        eager: [
+          {
+            format: "jpg",
+            width: 720,
+            crop: "limit",
+            start_offset: "1",
+          },
+        ],
+      },
+      (error, result) => {
+        if (error || !result) {
+          return reject(error || new Error("Cloudinary upload failed"));
+        }
+        return resolve(result);
+      },
+    );
+
+    uploadStream.end(buffer);
+  });
 };
 
 const listReels = async (req, res, next) => {
@@ -406,10 +463,9 @@ const markReady = async (req, res, next) => {
     }
 
     reel.playbackUrl = req.body.playbackUrl.trim();
-    reel.thumbUrl =
-      typeof req.body.thumbUrl === "string"
-        ? req.body.thumbUrl.trim()
-        : reel.thumbUrl;
+    if (typeof req.body.thumbUrl === "string" && req.body.thumbUrl.trim()) {
+      reel.thumbUrl = req.body.thumbUrl.trim();
+    }
     reel.duration = Number.isFinite(req.body.duration)
       ? Number(req.body.duration)
       : reel.duration;
@@ -451,51 +507,100 @@ const uploadLocalVideo = async (req, res, next) => {
       throw createHttpError(403, "You can manage only your own reels");
     }
 
+    const multipartBuffer = req.file?.buffer;
     const rawBase64 =
       typeof req.body.base64Data === "string" ? req.body.base64Data : "";
-    if (!rawBase64) {
-      throw createHttpError(400, "base64Data is required");
+    const hasMultipartVideo = Boolean(multipartBuffer?.length);
+    const hasBase64Video = Boolean(rawBase64.trim());
+
+    if (!hasMultipartVideo && !hasBase64Video) {
+      throw createHttpError(400, "Provide multipart video file or base64Data");
     }
 
-    const mimeType =
-      typeof req.body.mimeType === "string" && req.body.mimeType.trim()
-        ? req.body.mimeType.trim()
-        : "video/mp4";
-    const fileName =
-      typeof req.body.fileName === "string" && req.body.fileName.trim()
-        ? req.body.fileName.trim()
-        : "original.mp4";
+    let buffer;
+    let mimeType;
+    let fileName;
 
-    const payload = rawBase64.includes(",")
-      ? rawBase64.slice(rawBase64.indexOf(",") + 1)
-      : rawBase64;
+    if (hasMultipartVideo) {
+      buffer = multipartBuffer;
+      mimeType =
+        (typeof req.file?.mimetype === "string" && req.file.mimetype.trim()) ||
+        (typeof req.body.mimeType === "string" && req.body.mimeType.trim()) ||
+        "video/mp4";
+      fileName =
+        (typeof req.file?.originalname === "string" &&
+          req.file.originalname.trim()) ||
+        (typeof req.body.fileName === "string" && req.body.fileName.trim()) ||
+        "original.mp4";
+    } else {
+      const payload = rawBase64.includes(",")
+        ? rawBase64.slice(rawBase64.indexOf(",") + 1)
+        : rawBase64;
 
-    const buffer = Buffer.from(payload, "base64");
-    if (!buffer.length) {
-      throw createHttpError(400, "Invalid base64Data");
+      buffer = Buffer.from(payload, "base64");
+      mimeType =
+        typeof req.body.mimeType === "string" && req.body.mimeType.trim()
+          ? req.body.mimeType.trim()
+          : "video/mp4";
+      fileName =
+        typeof req.body.fileName === "string" && req.body.fileName.trim()
+          ? req.body.fileName.trim()
+          : "original.mp4";
+    }
+
+    if (!buffer || !buffer.length) {
+      throw createHttpError(400, "Invalid video payload");
     }
     if (buffer.length > LOCAL_REEL_UPLOAD_LIMIT_BYTES) {
       throw createHttpError(413, "Video too large. Max allowed is 40MB");
     }
 
-    const storageKey = buildStorageKey({
+    console.log("[reels] uploading video to Cloudinary", {
+      reelId: reel._id.toString(),
+      userId: req.user._id.toString(),
+      mimeType,
+      fileName,
+      sizeBytes: buffer.length,
+      via: hasMultipartVideo ? "multipart" : "base64",
+    });
+
+    const uploaded = await uploadVideoBufferToCloudinary({
+      buffer,
+      mimeType,
       userId: req.user._id.toString(),
       reelId: reel._id.toString(),
-      fileName,
-      mimeType,
-    }).replace(/\\/g, "/");
+    });
 
-    const absolutePath = path.join(UPLOADS_ROOT, storageKey);
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-    await fs.writeFile(absolutePath, buffer);
+    const storageKey = uploaded.public_id
+      ? `cloudinary:${uploaded.public_id}`
+      : buildStorageKey({
+          userId: req.user._id.toString(),
+          reelId: reel._id.toString(),
+          fileName,
+          mimeType,
+        }).replace(/\\/g, "/");
+    const videoUrl = uploaded.secure_url || uploaded.url || "";
+    const generatedThumbUrl =
+      (Array.isArray(uploaded.eager) && uploaded.eager[0]?.secure_url) || "";
 
-    const host = req.get("host");
-    const protocol = req.protocol || "http";
-    const videoUrl = `${protocol}://${host}/uploads/${storageKey}`;
+    if (!videoUrl) {
+      throw createHttpError(500, "Cloudinary upload did not return video URL");
+    }
 
     reel.storageKey = storageKey;
     reel.originalUrl = videoUrl;
+    if (generatedThumbUrl) {
+      reel.thumbUrl = generatedThumbUrl;
+    }
     await reel.save();
+
+    console.log("[reels] Cloudinary upload success", {
+      reelId: reel._id.toString(),
+      userId: req.user._id.toString(),
+      storageKey,
+      videoUrl,
+      thumbUrl: generatedThumbUrl || "(none)",
+    });
 
     return res.status(200).json({
       storageKey,
@@ -503,6 +608,7 @@ const uploadLocalVideo = async (req, res, next) => {
       reel: mapReel(reel, req.user._id.toString(), req),
     });
   } catch (error) {
+    console.error("[reels] Cloudinary upload failed:", error);
     return next(error);
   }
 };
