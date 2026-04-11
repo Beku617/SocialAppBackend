@@ -26,6 +26,13 @@ const mapComment = (comment, currentUserId) => {
     parentCommentId: comment.parentComment
       ? comment.parentComment.toString()
       : null,
+    repliedToUserId: comment.repliedToUser
+      ? comment.repliedToUser.toString()
+      : "",
+    repliedToUsername:
+      typeof comment.repliedToUsername === "string"
+        ? comment.repliedToUsername
+        : "",
     likesCount: comment.likes?.length || 0,
     dislikesCount: comment.dislikes?.length || 0,
     likedByMe: Array.isArray(comment.likes)
@@ -117,14 +124,26 @@ const addComment = async (req, res, next) => {
     }
 
     const parentCommentId = req.body.parentCommentId || null;
+    let parent = null;
+    let repliedToUserId = "";
+    let repliedToUsername = "";
     if (parentCommentId) {
       if (!mongoose.Types.ObjectId.isValid(parentCommentId)) {
         throw createHttpError(400, "Invalid parent comment id");
       }
-      const parent = await ReelComment.findById(parentCommentId);
+      parent = await ReelComment.findById(parentCommentId)
+        .populate("author", "username name")
+        .lean();
       if (!parent || parent.reel.toString() !== reelId) {
         throw createHttpError(404, "Parent comment not found");
       }
+
+      repliedToUserId = toIdString(parent.author);
+      repliedToUsername =
+        parent.author?.username ||
+        parent.author?.name ||
+        req.body?.repliedToUsername ||
+        "";
     }
 
     const comment = await ReelComment.create({
@@ -132,6 +151,8 @@ const addComment = async (req, res, next) => {
       author: currentUserId,
       text,
       parentComment: parentCommentId,
+      repliedToUser: repliedToUserId || null,
+      repliedToUsername,
     });
 
     // Update reel commentsCount
@@ -166,6 +187,42 @@ const addComment = async (req, res, next) => {
       } catch (notificationError) {
         console.warn(
           "[reel_comment] notification dispatch failed:",
+          notificationError,
+        );
+      }
+    }
+
+    if (
+      repliedToUserId &&
+      repliedToUserId !== currentUserId &&
+      repliedToUserId !== reelAuthorId
+    ) {
+      try {
+        const repliedUser = await User.findById(repliedToUserId).select(
+          "expoPushTokens",
+        );
+        await createUserNotification({
+          userId: repliedToUserId,
+          type: "reel_comment",
+          title: `${req.user?.name || "Someone"} replied to your comment`,
+          body: text.slice(0, 160) || "Someone replied to your comment.",
+          data: {
+            type: "reel_comment",
+            reelId: reel._id.toString(),
+            commentId: comment._id.toString(),
+            actorId: currentUserId,
+            actorName: req.user?.name || "",
+            isReply: true,
+          },
+          push: {
+            enabled: true,
+            tokens: repliedUser?.expoPushTokens || [],
+            channelId: "messages",
+          },
+        });
+      } catch (notificationError) {
+        console.warn(
+          "[reel_reply] notification dispatch failed:",
           notificationError,
         );
       }

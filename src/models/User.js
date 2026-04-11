@@ -46,6 +46,17 @@ const userSchema = new mongoose.Schema(
       maxlength: 160,
       trim: true,
     },
+    noteText: {
+      type: String,
+      default: "",
+      trim: true,
+      maxlength: 120,
+    },
+    noteUpdatedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
     followers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
     following: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
     friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
@@ -81,6 +92,8 @@ userSchema.set("toJSON", {
     delete ret.__v;
     delete ret.passwordHash;
     delete ret.expoPushTokens;
+    delete ret.noteText;
+    delete ret.noteUpdatedAt;
     return ret;
   },
 });

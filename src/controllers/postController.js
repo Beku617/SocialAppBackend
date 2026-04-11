@@ -5,9 +5,11 @@ const User = require("../models/User");
 const { createHttpError } = require("../utils/httpError");
 const { normalizeImageUrls, serializePost } = require("../utils/serializePost");
 const { createUserNotification } = require("../utils/notificationCenter");
+const {
+  canViewerSeeContent,
+  normalizeVisibilityInput,
+} = require("../utils/visibility");
 const bcrypt = require("bcryptjs");
-
-const ALLOWED_POST_VISIBILITY = ["public", "friends", "private"];
 
 const toIdString = (value) => {
   if (!value) return "";
@@ -17,16 +19,7 @@ const toIdString = (value) => {
 };
 
 const normalizePostVisibility = (value) => {
-  if (value === undefined || value === null || value === "") {
-    return "public";
-  }
-
-  const normalized = String(value).toLowerCase().trim();
-  if (!ALLOWED_POST_VISIBILITY.includes(normalized)) {
-    throw createHttpError(400, "Invalid post visibility");
-  }
-
-  return normalized;
+  return normalizeVisibilityInput(value, { errorMessage: "Invalid post visibility" });
 };
 
 const buildFriendIdSet = (user) =>
@@ -41,15 +34,26 @@ const isBlockedAuthor = (post, blockedIdSet) =>
   blockedIdSet.has(toIdString(post?.author));
 
 const canViewerSeePost = (post, viewerId, friendIdSet) => {
-  const authorId = toIdString(post?.author);
-  const visibility =
-    typeof post?.visibility === "string" ? post.visibility : "public";
+  return canViewerSeeContent({
+    visibility: post?.visibility,
+    authorId: toIdString(post?.author),
+    viewerId,
+    friendIdSet,
+  });
+};
 
-  if (!authorId) return true;
-  if (authorId === viewerId) return true;
-  if (visibility === "public") return true;
-  if (visibility === "friends") return friendIdSet.has(authorId);
-  return false;
+const flattenComments = (comments) => {
+  if (!Array.isArray(comments) || comments.length === 0) return [];
+  const stack = [...comments];
+  const result = [];
+  while (stack.length) {
+    const next = stack.shift();
+    result.push(next);
+    if (Array.isArray(next?.replies) && next.replies.length > 0) {
+      stack.unshift(...next.replies);
+    }
+  }
+  return result;
 };
 
 const listPosts = async (req, res, next) => {
@@ -87,7 +91,9 @@ const listPosts = async (req, res, next) => {
         return post;
       });
 
-    return res.status(200).json({ posts: visiblePosts.map(serializePost) });
+    return res.status(200).json({
+      posts: visiblePosts.map((post) => serializePost(post, viewerId)),
+    });
   } catch (error) {
     return next(error);
   }
@@ -129,7 +135,7 @@ const getPost = async (req, res, next) => {
       post.sharedPost = null;
     }
 
-    return res.status(200).json({ post: serializePost(post) });
+    return res.status(200).json({ post: serializePost(post, viewerId) });
   } catch (error) {
     return next(error);
   }
@@ -141,8 +147,8 @@ const createPost = async (req, res, next) => {
     const imageUrls = normalizeImageUrls(req.body);
     const visibility = normalizePostVisibility(req.body.visibility);
 
-    if (!text && imageUrls.length === 0) {
-      throw createHttpError(400, "Post must include text or at least one image");
+    if (imageUrls.length === 0) {
+      throw createHttpError(400, "Post must include at least one image");
     }
 
     const post = await Post.create({
@@ -168,7 +174,9 @@ const createPost = async (req, res, next) => {
       .populate("comments.author", "name avatarUrl")
       .lean();
 
-    return res.status(201).json({ post: serializePost(createdPost) });
+    return res.status(201).json({
+      post: serializePost(createdPost, req.user._id.toString()),
+    });
   } catch (error) {
     return next(error);
   }
@@ -193,8 +201,8 @@ const updatePost = async (req, res, next) => {
       throw createHttpError(403, "You can edit only your own posts");
     }
 
-    if (!text && imageUrls.length === 0) {
-      throw createHttpError(400, "Post must include text or at least one image");
+    if (imageUrls.length === 0) {
+      throw createHttpError(400, "Post must include at least one image");
     }
 
     post.text = text;
@@ -217,7 +225,9 @@ const updatePost = async (req, res, next) => {
       .populate("comments.author", "name avatarUrl")
       .lean();
 
-    return res.status(200).json({ post: serializePost(updatedPost) });
+    return res.status(200).json({
+      post: serializePost(updatedPost, req.user._id.toString()),
+    });
   } catch (error) {
     return next(error);
   }
@@ -272,7 +282,7 @@ const toggleLike = async (req, res, next) => {
           actorName: req.user?.name || "",
         },
         push: {
-          enabled: !post.notificationsEnabled,
+          enabled: post.notificationsEnabled !== false,
           tokens: postAuthor?.expoPushTokens || [],
           channelId: "messages",
         },
@@ -292,6 +302,11 @@ const addComment = async (req, res, next) => {
   try {
     const { postId } = req.params;
     const text = String(req.body?.text || "").trim();
+    const parentCommentId =
+      typeof req.body?.parentCommentId === "string" &&
+      req.body.parentCommentId.trim()
+        ? req.body.parentCommentId.trim()
+        : "";
     const userId = req.user._id.toString();
     const friendIdSet = buildFriendIdSet(req.user);
     const blockedIdSet = buildBlockedIdSet(req.user);
@@ -308,14 +323,50 @@ const addComment = async (req, res, next) => {
       throw createHttpError(403, "Action not allowed");
     }
 
+    let parentComment = null;
+    let repliedToUserId = "";
+    let repliedToUsername = "";
+
+    if (parentCommentId) {
+      if (!mongoose.Types.ObjectId.isValid(parentCommentId)) {
+        throw createHttpError(400, "Invalid parent comment id");
+      }
+      parentComment = post.comments.id(parentCommentId);
+      if (!parentComment) {
+        throw createHttpError(404, "Parent comment not found");
+      }
+
+      repliedToUserId = parentComment.author?.toString?.() || "";
+      if (repliedToUserId) {
+        const repliedUser = await User.findById(repliedToUserId).select(
+          "username name",
+        );
+        repliedToUsername =
+          repliedUser?.username ||
+          repliedUser?.name ||
+          req.body?.repliedToUsername ||
+          "";
+      }
+    }
+
+    const newCommentId = new mongoose.Types.ObjectId();
     post.comments.push({
+      _id: newCommentId,
       author: req.user._id,
       text,
+      parentComment: parentComment?._id || null,
+      repliedToUser: repliedToUserId || null,
+      repliedToUsername,
+      likes: [],
     });
     await post.save();
     await post.populate("comments.author", "name avatarUrl");
 
-    const comment = post.comments[post.comments.length - 1];
+    const serializedPost = serializePost(post, userId);
+    const serializedComments = flattenComments(serializedPost.comments);
+    const comment =
+      serializedComments.find((item) => item.id === newCommentId.toString()) ||
+      null;
 
     const authorId = post.author.toString();
     const actorId = req.user._id.toString();
@@ -331,19 +382,104 @@ const addComment = async (req, res, next) => {
         data: {
           type: "post_comment",
           postId: post._id.toString(),
-          commentId: comment._id.toString(),
+          commentId: newCommentId.toString(),
           actorId,
           actorName: req.user?.name || "",
         },
         push: {
-          enabled: !post.notificationsEnabled,
+          enabled: post.notificationsEnabled !== false,
           tokens: postAuthor?.expoPushTokens || [],
           channelId: "messages",
         },
       });
     }
 
-    return res.status(201).json({ comment });
+    if (
+      repliedToUserId &&
+      repliedToUserId !== actorId &&
+      repliedToUserId !== authorId
+    ) {
+      try {
+        const repliedUser = await User.findById(repliedToUserId).select(
+          "expoPushTokens",
+        );
+        await createUserNotification({
+          userId: repliedToUserId,
+          type: "post_comment",
+          title: `${req.user?.name || "Someone"} replied to your comment`,
+          body: text.slice(0, 160) || "Someone replied to your comment.",
+          data: {
+            type: "post_comment",
+            postId: post._id.toString(),
+            commentId: newCommentId.toString(),
+            actorId,
+            actorName: req.user?.name || "",
+            isReply: true,
+          },
+          push: {
+            enabled: post.notificationsEnabled !== false,
+            tokens: repliedUser?.expoPushTokens || [],
+            channelId: "messages",
+          },
+        });
+      } catch (notificationError) {
+        console.warn(
+          "[post_reply] notification dispatch failed:",
+          notificationError,
+        );
+      }
+    }
+
+    return res.status(201).json({
+      comment,
+      commentsCount: serializedComments.length,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const toggleCommentLike = async (req, res, next) => {
+  try {
+    const { postId, commentId } = req.params;
+    const userId = req.user._id.toString();
+    const friendIdSet = buildFriendIdSet(req.user);
+    const blockedIdSet = buildBlockedIdSet(req.user);
+    const post = await Post.findById(postId);
+
+    if (!post) {
+      throw createHttpError(404, "Post not found");
+    }
+
+    if (!canViewerSeePost(post, userId, friendIdSet)) {
+      throw createHttpError(403, "You cannot interact with this post");
+    }
+    if (isBlockedAuthor(post, blockedIdSet)) {
+      throw createHttpError(403, "Action not allowed");
+    }
+
+    const comment = post.comments.id(commentId);
+    if (!comment) {
+      throw createHttpError(404, "Comment not found");
+    }
+
+    const existingIndex = comment.likes.findIndex(
+      (id) => id.toString() === userId,
+    );
+    const liked = existingIndex === -1;
+
+    if (liked) {
+      comment.likes.push(new mongoose.Types.ObjectId(userId));
+    } else {
+      comment.likes.splice(existingIndex, 1);
+    }
+
+    await post.save();
+
+    return res.status(200).json({
+      liked,
+      likeCount: comment.likes.length,
+    });
   } catch (error) {
     return next(error);
   }
@@ -457,7 +593,9 @@ const sharePost = async (req, res, next) => {
       .populate("comments.author", "name avatarUrl")
       .lean();
 
-    return res.status(201).json({ post: serializePost(createdPost) });
+    return res.status(201).json({
+      post: serializePost(createdPost, req.user._id.toString()),
+    });
   } catch (error) {
     return next(error);
   }
@@ -552,7 +690,7 @@ const seedPosts = async (_req, res, next) => {
       {
         author: seedUsers[2]._id,
         text: "Just finished my first marathon! 🏃‍♀️ So proud of this achievement! Never give up on your dreams 💪",
-        imageUrl: "",
+        imageUrl: "https://picsum.photos/800/500?random=7",
         likes: [seedUsers[0]._id, seedUsers[1]._id, seedUsers[3]._id],
         comments: [
           { author: seedUsers[0]._id, text: "Congratulations!! 🎉" },
@@ -584,6 +722,7 @@ module.exports = {
   updatePost,
   toggleLike,
   addComment,
+  toggleCommentLike,
   reportPost,
   sharePost,
   togglePostNotifications,

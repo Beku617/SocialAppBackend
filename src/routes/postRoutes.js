@@ -9,12 +9,14 @@ const {
   reportPost,
   sharePost,
   toggleLike,
+  toggleCommentLike,
   togglePostNotifications,
   updatePost,
   seedPosts,
 } = require("../controllers/postController");
 const { requireAuth } = require("../middlewares/auth");
 const { validateRequest } = require("../utils/validateRequest");
+const { VISIBILITY_VALUES } = require("../utils/visibility");
 
 const router = express.Router();
 
@@ -52,11 +54,9 @@ router.post(
       .withMessage("Each imageUrls entry must be a string"),
     body("visibility")
       .optional({ values: "falsy" })
-      .isIn(["public", "friends", "private"])
+      .isIn(VISIBILITY_VALUES)
       .withMessage("visibility must be public/friends/private"),
     body().custom((_value, { req }) => {
-      const text =
-        typeof req.body.text === "string" ? req.body.text.trim() : "";
       const hasImageUrl =
         typeof req.body.imageUrl === "string" && req.body.imageUrl.trim().length > 0;
       const hasImageUrls =
@@ -65,8 +65,8 @@ router.post(
           (imageUrl) => typeof imageUrl === "string" && imageUrl.trim().length > 0,
         );
 
-      if (!text && !hasImageUrl && !hasImageUrls) {
-        throw new Error("Post must include text or at least one image");
+      if (!hasImageUrl && !hasImageUrls) {
+        throw new Error("Post must include at least one image");
       }
 
       return true;
@@ -100,11 +100,9 @@ router.put(
       .withMessage("Each imageUrls entry must be a string"),
     body("visibility")
       .optional({ values: "falsy" })
-      .isIn(["public", "friends", "private"])
+      .isIn(VISIBILITY_VALUES)
       .withMessage("visibility must be public/friends/private"),
     body().custom((_value, { req }) => {
-      const text =
-        typeof req.body.text === "string" ? req.body.text.trim() : "";
       const hasImageUrl =
         typeof req.body.imageUrl === "string" && req.body.imageUrl.trim().length > 0;
       const hasImageUrls =
@@ -113,8 +111,8 @@ router.put(
           (imageUrl) => typeof imageUrl === "string" && imageUrl.trim().length > 0,
         );
 
-      if (!text && !hasImageUrl && !hasImageUrls) {
-        throw new Error("Post must include text or at least one image");
+      if (!hasImageUrl && !hasImageUrls) {
+        throw new Error("Post must include at least one image");
       }
 
       return true;
@@ -136,7 +134,7 @@ router.post(
       .withMessage("Share caption must be 2200 chars or fewer"),
     body("visibility")
       .optional({ values: "falsy" })
-      .isIn(["public", "friends", "private"])
+      .isIn(VISIBILITY_VALUES)
       .withMessage("visibility must be public/friends/private"),
     validateRequest,
   ],
@@ -166,9 +164,24 @@ router.post(
       .trim()
       .isLength({ min: 1, max: 500 })
       .withMessage("Comment must be 1-500 chars"),
+    body("parentCommentId")
+      .optional({ values: "falsy" })
+      .isMongoId()
+      .withMessage("Invalid parent comment id"),
     validateRequest,
   ],
   addComment,
+);
+
+router.post(
+  "/:postId/comments/:commentId/like",
+  requireAuth,
+  [
+    param("postId").isMongoId().withMessage("Invalid post id"),
+    param("commentId").isMongoId().withMessage("Invalid comment id"),
+    validateRequest,
+  ],
+  toggleCommentLike,
 );
 
 router.post(

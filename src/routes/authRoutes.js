@@ -1,10 +1,12 @@
 const express = require("express");
-const { body, param } = require("express-validator");
+const { body, param, query } = require("express-validator");
 const {
+  checkUsernameAvailability,
   getMe,
   login,
   register,
   savePushToken,
+  removePushToken,
   updateProfile,
   changePassword,
   deleteAccount,
@@ -27,11 +29,13 @@ const router = express.Router();
 router.post(
   "/register",
   [
-    body("name")
-      .trim()
-      .isLength({ min: 2, max: 60 })
-      .withMessage("Name must be 2-60 chars"),
     body("email").trim().isEmail().withMessage("Provide a valid email"),
+    body("username")
+      .trim()
+      .matches(/^[a-zA-Z0-9._]{3,30}$/)
+      .withMessage(
+        "Username must be 3-30 chars and use letters, numbers, dot, or underscore",
+      ),
     body("password")
       .isString()
       .isLength({ min: 8, max: 64 })
@@ -39,6 +43,18 @@ router.post(
     validateRequest,
   ],
   register,
+);
+
+router.get(
+  "/username/check",
+  [
+    query("username")
+      .optional({ values: "falsy" })
+      .isString()
+      .withMessage("username must be a string"),
+    validateRequest,
+  ],
+  checkUsernameAvailability,
 );
 
 router.post(
@@ -70,6 +86,22 @@ router.post(
     validateRequest,
   ],
   savePushToken,
+);
+
+router.delete(
+  "/push-token",
+  requireAuth,
+  [
+    body().custom((_, { req }) => {
+      const token = String(req.body?.token || req.body?.pushToken || "").trim();
+      if (!token) {
+        throw new Error("Push token is required");
+      }
+      return true;
+    }),
+    validateRequest,
+  ],
+  removePushToken,
 );
 
 router.put(

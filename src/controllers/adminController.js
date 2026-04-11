@@ -1,5 +1,3 @@
-const fs = require("fs/promises");
-const path = require("path");
 const Message = require("../models/Message");
 const Post = require("../models/Post");
 const Report = require("../models/Report");
@@ -7,6 +5,8 @@ const Reel = require("../models/Reel");
 const ReelComment = require("../models/ReelComment");
 const Story = require("../models/Story");
 const User = require("../models/User");
+const cloudinary = require("../config/cloudinary");
+const { env } = require("../config/env");
 const { createHttpError } = require("../utils/httpError");
 const { createUserNotification } = require("../utils/notificationCenter");
 const { normalizeImageUrls, serializePost } = require("../utils/serializePost");
@@ -17,8 +17,7 @@ const {
   clearUserBan,
 } = require("../utils/userAccess");
 
-const LOCAL_REEL_UPLOAD_LIMIT_BYTES = 40 * 1024 * 1024;
-const UPLOADS_ROOT = path.join(__dirname, "../../uploads");
+const REEL_UPLOAD_LIMIT_BYTES = 40 * 1024 * 1024;
 const ALLOWED_REEL_VISIBILITY = [
   "public",
   "friends",
@@ -97,39 +96,102 @@ const toIdString = (value) => {
 const arrayHasUser = (values, userId) =>
   Array.isArray(values) && values.some((value) => toIdString(value) === userId);
 
-const resolveLocalReelUrl = (url, storageKey, req) => {
-  if (
-    storageKey &&
-    storageKey.startsWith("reels/") &&
-    !storageKey.startsWith("reels/demo/")
-  ) {
-    const protocol = req.protocol || "http";
-    const host = req.get("host");
-    return `${protocol}://${host}/uploads/${storageKey}`;
+const isCloudinaryConfigured = () =>
+  Boolean(
+    env.CLOUDINARY_CLOUD_NAME &&
+      env.CLOUDINARY_API_KEY &&
+      env.CLOUDINARY_API_SECRET,
+  );
+
+const buildCloudinaryPublicId = ({ userId, reelId }) =>
+  `${userId}/${reelId}/original`;
+
+const buildStorageKeyFromPublicId = (publicId) => `cloudinary:${publicId}`;
+
+const uploadVideoBufferToCloudinary = async ({
+  buffer,
+  mimeType,
+  userId,
+  reelId,
+}) => {
+  if (!isCloudinaryConfigured()) {
+    throw createHttpError(
+      500,
+      "Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.",
+    );
   }
 
-  return url || "";
-};
-
-const buildReelStorageKey = ({ userId, reelId, fileName, mimeType }) => {
-  const safeName =
-    typeof fileName === "string" && fileName.trim()
-      ? fileName.trim()
-      : "original";
-  const parsed = path.parse(safeName);
-  const extensionFromName = parsed.ext?.replace(".", "");
-  const extensionFromMime =
+  const formatFromMime =
     typeof mimeType === "string" && mimeType.includes("/")
-      ? mimeType.split("/")[1]
-      : "mp4";
-  const ext = (extensionFromName || extensionFromMime || "mp4")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
+      ? mimeType.split("/")[1].toLowerCase()
+      : "";
 
-  return `reels/${userId}/${reelId}/original.${ext || "mp4"}`;
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: "video",
+        folder: "reels",
+        public_id: buildCloudinaryPublicId({ userId, reelId }),
+        overwrite: true,
+        quality: "auto",
+        fetch_format: "auto",
+        timeout: env.REELS_UPLOAD_TIMEOUT_MS,
+        ...(formatFromMime ? { format: formatFromMime } : {}),
+        eager: [
+          {
+            format: "jpg",
+            width: 720,
+            crop: "limit",
+            start_offset: "1",
+          },
+        ],
+      },
+      (error, result) => {
+        if (error) {
+          return reject(
+            createHttpError(
+              502,
+              `Cloudinary upload failed: ${error.message || "unknown error"}`,
+            ),
+          );
+        }
+        if (!result) {
+          return reject(
+            createHttpError(502, "Cloudinary upload failed: empty response."),
+          );
+        }
+        return resolve(result);
+      },
+    );
+
+    uploadStream.end(buffer);
+  });
 };
 
-const serializeAdminReel = (reel, req, currentUserId = "") => {
+const getCloudinaryPublicIdFromReel = (reel) => {
+  if (typeof reel.cloudinaryPublicId === "string" && reel.cloudinaryPublicId.trim()) {
+    return reel.cloudinaryPublicId.trim();
+  }
+  if (typeof reel.storageKey === "string" && reel.storageKey.startsWith("cloudinary:")) {
+    return reel.storageKey.replace("cloudinary:", "").trim();
+  }
+  return "";
+};
+
+const deleteCloudinaryVideo = async (publicId) => {
+  if (!publicId || !isCloudinaryConfigured()) return;
+
+  try {
+    await cloudinary.uploader.destroy(publicId, { resource_type: "video" });
+  } catch (error) {
+    console.warn("[admin][reels] failed to delete Cloudinary asset", {
+      publicId,
+      error: error?.message || String(error),
+    });
+  }
+};
+
+const serializeAdminReel = (reel, currentUserId = "") => {
   const authorId = toIdString(reel.author);
   const storageKey = reel.storageKey || "";
 
@@ -143,8 +205,8 @@ const serializeAdminReel = (reel, req, currentUserId = "") => {
     caption: reel.caption || "",
     music: reel.music || "",
     storageKey,
-    originalUrl: resolveLocalReelUrl(reel.originalUrl, storageKey, req),
-    playbackUrl: resolveLocalReelUrl(reel.playbackUrl, storageKey, req),
+    originalUrl: reel.originalUrl || "",
+    playbackUrl: reel.playbackUrl || "",
     thumbUrl: reel.thumbUrl || "",
     duration: reel.duration || 0,
     width: reel.width || 0,
@@ -559,8 +621,8 @@ const createAdminPost = async (req, res, next) => {
     const text = typeof req.body.text === "string" ? req.body.text.trim() : "";
     const imageUrls = normalizeImageUrls(req.body);
 
-    if (!text && imageUrls.length === 0) {
-      throw createHttpError(400, "Post must include text or at least one image");
+    if (imageUrls.length === 0) {
+      throw createHttpError(400, "Post must include at least one image");
     }
 
     const post = await Post.create({
@@ -608,7 +670,7 @@ const listReels = async (req, res, next) => {
 
     return res.status(200).json({
       reels: reels.map((reel) =>
-        serializeAdminReel(reel, req, req.user._id.toString()),
+        serializeAdminReel(reel, req.user._id.toString()),
       ),
     });
   } catch (error) {
@@ -627,7 +689,7 @@ const getReelDetails = async (req, res, next) => {
     }
 
     return res.status(200).json({
-      reel: serializeAdminReel(reel, req, req.user._id.toString()),
+      reel: serializeAdminReel(reel, req.user._id.toString()),
     });
   } catch (error) {
     return next(error);
@@ -650,10 +712,6 @@ const createAdminReel = async (req, res, next) => {
       typeof req.body.mimeType === "string" && req.body.mimeType.trim()
         ? req.body.mimeType.trim()
         : "video/mp4";
-    const fileName =
-      typeof req.body.fileName === "string" && req.body.fileName.trim()
-        ? req.body.fileName.trim()
-        : "original.mp4";
     const duration = Number.isFinite(req.body.duration)
       ? Number(req.body.duration)
       : 0;
@@ -675,8 +733,14 @@ const createAdminReel = async (req, res, next) => {
       throw createHttpError(400, "Invalid video data");
     }
 
-    if (buffer.length > LOCAL_REEL_UPLOAD_LIMIT_BYTES) {
+    if (buffer.length > REEL_UPLOAD_LIMIT_BYTES) {
       throw createHttpError(413, "Video too large. Max allowed is 40MB");
+    }
+    if (!isCloudinaryConfigured()) {
+      throw createHttpError(
+        500,
+        "Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.",
+      );
     }
 
     const reel = await Reel.create({
@@ -687,24 +751,33 @@ const createAdminReel = async (req, res, next) => {
       status: "uploading",
     });
 
-    const storageKey = buildReelStorageKey({
+    const uploaded = await uploadVideoBufferToCloudinary({
+      buffer,
+      mimeType,
       userId: req.user._id.toString(),
       reelId: reel._id.toString(),
-      fileName,
-      mimeType,
     });
-    const absolutePath = path.join(UPLOADS_ROOT, storageKey);
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-    await fs.writeFile(absolutePath, buffer);
+    const publicId =
+      typeof uploaded.public_id === "string" ? uploaded.public_id.trim() : "";
+    const videoUrl =
+      typeof uploaded.secure_url === "string" && uploaded.secure_url.trim()
+        ? uploaded.secure_url.trim()
+        : "";
+    const generatedThumbUrl =
+      (Array.isArray(uploaded.eager) && uploaded.eager[0]?.secure_url) || "";
+    if (!publicId || !videoUrl) {
+      throw createHttpError(
+        500,
+        "Cloudinary upload failed to return required media metadata.",
+      );
+    }
 
-    const protocol = req.protocol || "http";
-    const host = req.get("host");
-    const videoUrl = `${protocol}://${host}/uploads/${storageKey}`;
-
+    const storageKey = buildStorageKeyFromPublicId(publicId);
+    reel.cloudinaryPublicId = publicId;
     reel.storageKey = storageKey;
     reel.originalUrl = videoUrl;
     reel.playbackUrl = videoUrl;
-    reel.thumbUrl = thumbUrl;
+    reel.thumbUrl = generatedThumbUrl || thumbUrl;
     reel.duration = duration;
     reel.width = width;
     reel.height = height;
@@ -718,7 +791,7 @@ const createAdminReel = async (req, res, next) => {
       .lean();
 
     return res.status(201).json({
-      reel: serializeAdminReel(createdReel, req, req.user._id.toString()),
+      reel: serializeAdminReel(createdReel, req.user._id.toString()),
     });
   } catch (error) {
     return next(error);
@@ -732,10 +805,7 @@ const deleteAdminReel = async (req, res, next) => {
       throw createHttpError(404, "Reel not found");
     }
 
-    if (reel.storageKey && reel.storageKey.startsWith("reels/")) {
-      const absolutePath = path.join(UPLOADS_ROOT, reel.storageKey);
-      await fs.rm(path.dirname(absolutePath), { recursive: true, force: true });
-    }
+    await deleteCloudinaryVideo(getCloudinaryPublicIdFromReel(reel));
 
     await Promise.all([
       ReelComment.deleteMany({ reel: reel._id }),

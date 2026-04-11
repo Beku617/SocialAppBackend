@@ -2,8 +2,6 @@ const cors = require("cors");
 const express = require("express");
 const helmet = require("helmet");
 const morgan = require("morgan");
-const fs = require("fs");
-const path = require("path");
 const { env } = require("./config/env");
 const adminRoutes = require("./routes/adminRoutes");
 const authRoutes = require("./routes/authRoutes");
@@ -42,19 +40,6 @@ app.use(
 );
 app.use(cors(buildCorsOptions(env.CLIENT_ORIGIN)));
 app.use(express.json({ limit: "80mb" }));
-
-const uploadsDir = path.join(__dirname, "../uploads");
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-app.use(
-  "/uploads",
-  express.static(uploadsDir, {
-    setHeaders: (res) => {
-      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-    },
-  }),
-);
 
 if (env.NODE_ENV !== "test") {
   app.use(morgan("dev"));

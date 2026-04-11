@@ -18,6 +18,20 @@ const buildUsernameBase = (value) => {
   return normalized || `user${Date.now().toString().slice(-6)}`;
 };
 
+const normalizeUsername = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/^@+/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9._]+/g, "")
+    .slice(0, 30);
+
+const escapeRegex = (value) =>
+  String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const isUsernameFormatValid = (username) =>
+  /^[a-z0-9._]{3,30}$/.test(String(username || ""));
+
 const createUniqueUsername = async (name, email) => {
   const base = buildUsernameBase(email.split("@")[0] || name);
   let candidate = base;
@@ -82,8 +96,15 @@ const canViewerSeeContent = (visibility, authorId, viewerId, viewerFriendSet) =>
 
 const register = async (req, res, next) => {
   try {
-    const { name, email, password } = req.body;
-    const normalizedEmail = email.toLowerCase();
+    const { email, password } = req.body;
+    const requestedUsername = normalizeUsername(req.body?.username);
+    const normalizedEmail = String(email || "").toLowerCase();
+    if (!requestedUsername || !isUsernameFormatValid(requestedUsername)) {
+      throw createHttpError(
+        400,
+        "Username must be 3-30 chars and use letters, numbers, dot, or underscore",
+      );
+    }
 
     const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) {
@@ -91,9 +112,14 @@ const register = async (req, res, next) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const username = await createUniqueUsername(name, normalizedEmail);
+    const exists = await User.exists({ username: requestedUsername });
+    if (exists) {
+      throw createHttpError(409, "Username already taken");
+    }
+    const username = requestedUsername;
+
     const user = await User.create({
-      name,
+      name: username,
       email: normalizedEmail,
       username,
       passwordHash,
@@ -104,6 +130,38 @@ const register = async (req, res, next) => {
     return res.status(201).json({
       token,
       user: buildAuthUserPayload(user),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const checkUsernameAvailability = async (req, res, next) => {
+  try {
+    const username = normalizeUsername(req.query?.username);
+
+    if (!username) {
+      return res.status(200).json({
+        available: false,
+        username: "",
+        message: "Username is required",
+      });
+    }
+
+    if (!isUsernameFormatValid(username)) {
+      return res.status(200).json({
+        available: false,
+        username,
+        message:
+          "Username must be 3-30 chars and use letters, numbers, dot, or underscore",
+      });
+    }
+
+    const exists = await User.exists({ username });
+    return res.status(200).json({
+      available: !exists,
+      username,
+      message: exists ? "Username already taken" : "Username available",
     });
   } catch (error) {
     return next(error);
@@ -165,6 +223,12 @@ const savePushToken = async (req, res, next) => {
       throw createHttpError(400, "Invalid push token");
     }
 
+    // Keep one physical device token mapped to only one account.
+    await User.updateMany(
+      { _id: { $ne: req.user._id }, expoPushTokens: token },
+      { $pull: { expoPushTokens: token } },
+    );
+
     await User.updateOne(
       { _id: req.user._id },
       { $addToSet: { expoPushTokens: token } },
@@ -181,6 +245,20 @@ const savePushToken = async (req, res, next) => {
       "current expoPushTokens:",
       refreshedUser?.expoPushTokens || [],
     );
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const removePushToken = async (req, res, next) => {
+  try {
+    const token = String(req.body?.token || req.body?.pushToken || "").trim();
+    if (!isExpoPushToken(token)) {
+      throw createHttpError(400, "Invalid push token");
+    }
+
+    await User.updateMany({ expoPushTokens: token }, { $pull: { expoPushTokens: token } });
     return res.status(200).json({ ok: true });
   } catch (error) {
     return next(error);
@@ -248,8 +326,9 @@ const deleteAccount = async (req, res, next) => {
 
 const searchUsers = async (req, res, next) => {
   try {
-    const { q } = req.query;
-    if (!q || q.trim().length < 1) {
+    const rawQuery = String(req.query?.q || "").trim();
+    const normalizedQuery = normalizeUsername(rawQuery) || rawQuery.toLowerCase();
+    if (!normalizedQuery || normalizedQuery.length < 1) {
       return res.status(200).json({ users: [] });
     }
 
@@ -258,7 +337,7 @@ const searchUsers = async (req, res, next) => {
       ? req.user.blockedUsers.map((id) => id.toString())
       : [];
     const excludedIds = [currentUserId, ...blockedByCurrent];
-    const regex = new RegExp(q.trim(), "i");
+    const regex = new RegExp(escapeRegex(normalizedQuery), "i");
     const users = await User.find({
       _id: { $nin: excludedIds },
       blockedUsers: { $ne: req.user._id },
@@ -268,13 +347,20 @@ const searchUsers = async (req, res, next) => {
       .limit(20)
       .lean();
 
-    const result = users.map((u) => ({
+    const mapped = users.map((u) => ({
       id: u._id.toString(),
       name: u.name,
       username: u.username || "",
       avatarUrl: u.avatarUrl || "",
       bio: u.bio || "",
     }));
+
+    const result = mapped.sort((left, right) => {
+      const leftExact = left.username?.toLowerCase() === normalizedQuery ? 1 : 0;
+      const rightExact =
+        right.username?.toLowerCase() === normalizedQuery ? 1 : 0;
+      return rightExact - leftExact;
+    });
 
     return res.status(200).json({ users: result });
   } catch (error) {
@@ -346,7 +432,7 @@ const getUserProfile = async (req, res, next) => {
         ) {
           post.sharedPost = null;
         }
-        return serializePost(post);
+        return serializePost(post, viewerId);
       });
 
     const reels = allReels
@@ -825,10 +911,12 @@ const getFollowing = async (req, res, next) => {
 };
 
 module.exports = {
+  checkUsernameAvailability,
   register,
   login,
   getMe,
   savePushToken,
+  removePushToken,
   getMyPushTokensDebug,
   updateProfile,
   changePassword,

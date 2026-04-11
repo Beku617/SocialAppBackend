@@ -14,6 +14,17 @@ const hasUserId = (values, userId) =>
   Array.isArray(values) &&
   values.some((value) => toIdString(value) === String(userId));
 
+const NOTES_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_NOTE_LENGTH = 120;
+
+const isActiveNote = (text, updatedAt, nowMs) => {
+  if (!text || !String(text).trim()) return false;
+  if (!updatedAt) return false;
+  const ts = new Date(updatedAt).getTime();
+  if (!Number.isFinite(ts)) return false;
+  return nowMs - ts <= NOTES_TTL_MS;
+};
+
 // GET /api/messages/conversations — list all conversations (latest message per user)
 const getConversations = async (req, res, next) => {
   try {
@@ -189,6 +200,15 @@ const sendMessage = async (req, res, next) => {
         "receiverId:",
         otherUserId.toString(),
       );
+      const senderTokens = Array.isArray(req.user?.expoPushTokens)
+        ? req.user.expoPushTokens
+        : [];
+      const receiverTokens = Array.isArray(otherUser.expoPushTokens)
+        ? otherUser.expoPushTokens.filter(
+            (token) => !senderTokens.includes(token),
+          )
+        : [];
+
       await createUserNotification({
         userId: otherUserId,
         type: "dm",
@@ -202,7 +222,7 @@ const sendMessage = async (req, res, next) => {
         },
         push: {
           enabled: true,
-          tokens: otherUser.expoPushTokens || [],
+          tokens: receiverTokens,
           channelId: "messages",
         },
       });
@@ -225,8 +245,100 @@ const sendMessage = async (req, res, next) => {
   }
 };
 
+// GET /api/messages/notes — list friend-visible notes + my note
+const getFriendNotes = async (req, res, next) => {
+  try {
+    const currentUserId = req.user._id.toString();
+    const nowMs = Date.now();
+    const friendIds = Array.isArray(req.user.friends) ? req.user.friends : [];
+    const blockedByCurrent = new Set(
+      Array.isArray(req.user.blockedUsers)
+        ? req.user.blockedUsers.map((value) => toIdString(value))
+        : [],
+    );
+
+    const friends = await User.find({ _id: { $in: friendIds } })
+      .select("name avatarUrl blockedUsers noteText noteUpdatedAt")
+      .lean();
+
+    const notes = friends
+      .filter((friend) => {
+        const friendId = toIdString(friend._id);
+        if (!friendId) return false;
+        if (blockedByCurrent.has(friendId)) return false;
+        if (hasUserId(friend.blockedUsers, currentUserId)) return false;
+        return isActiveNote(friend.noteText, friend.noteUpdatedAt, nowMs);
+      })
+      .map((friend) => ({
+        userId: toIdString(friend._id),
+        name: friend.name || "User",
+        avatarUrl: friend.avatarUrl || "",
+        text: String(friend.noteText || "").trim(),
+        updatedAt: friend.noteUpdatedAt,
+      }))
+      .sort((a, b) => {
+        const left = new Date(a.updatedAt).getTime();
+        const right = new Date(b.updatedAt).getTime();
+        return right - left;
+      });
+
+    const hasMyNote = isActiveNote(req.user.noteText, req.user.noteUpdatedAt, nowMs);
+    const myNote = hasMyNote
+      ? {
+          text: String(req.user.noteText || "").trim(),
+          updatedAt: req.user.noteUpdatedAt,
+        }
+      : null;
+
+    return res.status(200).json({ notes, myNote });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// PUT /api/messages/notes/me — create or update my note
+const upsertMyNote = async (req, res, next) => {
+  try {
+    const rawText = String(req.body?.text || "").trim();
+    if (!rawText) {
+      throw createHttpError(400, "Note text is required");
+    }
+    if (rawText.length > MAX_NOTE_LENGTH) {
+      throw createHttpError(400, `Note must be ${MAX_NOTE_LENGTH} characters or less`);
+    }
+
+    req.user.noteText = rawText;
+    req.user.noteUpdatedAt = new Date();
+    await req.user.save();
+
+    return res.status(200).json({
+      note: {
+        text: req.user.noteText,
+        updatedAt: req.user.noteUpdatedAt,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// DELETE /api/messages/notes/me — clear my note
+const clearMyNote = async (req, res, next) => {
+  try {
+    req.user.noteText = "";
+    req.user.noteUpdatedAt = null;
+    await req.user.save();
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   getConversations,
   getMessages,
+  getFriendNotes,
+  upsertMyNote,
+  clearMyNote,
   sendMessage,
 };

@@ -34,6 +34,11 @@ router.post(
       .optional({ values: "falsy" })
       .isMongoId()
       .withMessage("Invalid parent comment id"),
+    body("repliedToUsername")
+      .optional({ values: "falsy" })
+      .isString()
+      .isLength({ max: 30 })
+      .withMessage("Invalid replied-to username"),
     validateRequest,
   ],
   addComment,

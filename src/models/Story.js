@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { VISIBILITY_VALUES } = require("../utils/visibility");
 
 const storySchema = new mongoose.Schema(
   {
@@ -17,6 +18,12 @@ const storySchema = new mongoose.Schema(
       default: "",
       maxlength: 200,
       trim: true,
+    },
+    visibility: {
+      type: String,
+      enum: VISIBILITY_VALUES,
+      default: "public",
+      index: true,
     },
     viewers: [
       {

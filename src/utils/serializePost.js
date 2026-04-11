@@ -36,12 +36,50 @@ const serializeAuthor = (author, fallbackId = "") => ({
     typeof author?.avatarUrl === "string" ? author.avatarUrl.trim() : "",
 });
 
-const serializeComment = (comment) => ({
+const arrayHasUser = (values, userId) =>
+  Array.isArray(values) &&
+  values.some((value) => toId(value) === String(userId || ""));
+
+const serializeComment = (comment, currentUserId = "") => ({
   id: toId(comment?.id || comment?._id),
   author: serializeAuthor(comment?.author),
   text: typeof comment?.text === "string" ? comment.text : "",
   createdAt: comment?.createdAt || null,
+  parentCommentId: toId(comment?.parentComment),
+  repliedToUserId: toId(comment?.repliedToUser),
+  repliedToUsername:
+    typeof comment?.repliedToUsername === "string"
+      ? comment.repliedToUsername
+      : "",
+  likesCount: Array.isArray(comment?.likes) ? comment.likes.length : 0,
+  likedByMe: arrayHasUser(comment?.likes, currentUserId),
+  replies: [],
 });
+
+const buildCommentTree = (comments, currentUserId = "") => {
+  if (!Array.isArray(comments) || comments.length === 0) return [];
+
+  const mapped = comments.map((comment) =>
+    serializeComment(comment, currentUserId),
+  );
+  const byId = new Map();
+  const roots = [];
+
+  mapped.forEach((comment) => {
+    byId.set(comment.id, comment);
+  });
+
+  mapped.forEach((comment) => {
+    const parentId = comment.parentCommentId;
+    if (parentId && byId.has(parentId)) {
+      byId.get(parentId).replies.push(comment);
+      return;
+    }
+    roots.push(comment);
+  });
+
+  return roots;
+};
 
 const serializeSharedPost = (post) => {
   if (!post) return null;
@@ -59,7 +97,7 @@ const serializeSharedPost = (post) => {
   };
 };
 
-const serializePost = (post) => {
+const serializePost = (post, currentUserId = "") => {
   const imageUrls = normalizeImageUrls(post);
 
   return {
@@ -69,9 +107,7 @@ const serializePost = (post) => {
     imageUrl: imageUrls[0] || "",
     imageUrls,
     likes: Array.isArray(post?.likes) ? post.likes.map((like) => toId(like)) : [],
-    comments: Array.isArray(post?.comments)
-      ? post.comments.map(serializeComment)
-      : [],
+    comments: buildCommentTree(post?.comments, currentUserId),
     visibility:
       typeof post?.visibility === "string" ? post.visibility : "public",
     sharedPost: serializeSharedPost(post?.sharedPost),

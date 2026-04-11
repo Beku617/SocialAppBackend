@@ -1,6 +1,6 @@
 const mongoose = require("mongoose");
+const { REEL_VISIBILITY_VALUES } = require("../utils/visibility");
 
-const visibilityValues = ["public", "friends", "followers", "private"];
 const statusValues = ["uploading", "processing", "ready", "failed"];
 
 const reelSchema = new mongoose.Schema(
@@ -24,6 +24,12 @@ const reelSchema = new mongoose.Schema(
       maxlength: 180,
     },
     storageKey: {
+      type: String,
+      default: "",
+      trim: true,
+      index: true,
+    },
+    cloudinaryPublicId: {
       type: String,
       default: "",
       trim: true,
@@ -61,7 +67,7 @@ const reelSchema = new mongoose.Schema(
     },
     visibility: {
       type: String,
-      enum: visibilityValues,
+      enum: REEL_VISIBILITY_VALUES,
       default: "public",
       index: true,
     },

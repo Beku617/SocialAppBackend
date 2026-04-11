@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
-    "lint": "node -e \"console.log('No lint configured for server yet')\""
+    "lint": "node -e \"console.log('No lint configured for server yet')\"",
+    "cleanup:usernames": "node src/scripts/cleanupDuplicateUsernames.js",
+    "cleanup:usernames:apply": "node src/scripts/cleanupDuplicateUsernames.js --apply",
+    "cleanup:text-only-posts": "node src/scripts/cleanupTextOnlyPosts.js",
+    "cleanup:text-only-posts:apply": "node src/scripts/cleanupTextOnlyPosts.js --apply"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -19,8 +23,7 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^9.2.1",
     "morgan": "^1.10.0",
-    "multer": "^2.1.1",
-    "multer-storage-cloudinary": "^4.0.0"
+    "multer": "^2.1.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"

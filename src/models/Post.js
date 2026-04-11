@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { VISIBILITY_VALUES } = require("../utils/visibility");
 
 const commentSchema = new mongoose.Schema(
   {
@@ -14,6 +15,27 @@ const commentSchema = new mongoose.Schema(
       minlength: 1,
       maxlength: 500,
     },
+    parentComment: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+    },
+    repliedToUser: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    repliedToUsername: {
+      type: String,
+      default: "",
+      trim: true,
+      maxlength: 30,
+    },
+    likes: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
+    ],
   },
   { timestamps: { createdAt: true, updatedAt: false } }
 );
@@ -43,7 +65,7 @@ const postSchema = new mongoose.Schema(
     },
     visibility: {
       type: String,
-      enum: ["public", "friends", "private"],
+      enum: VISIBILITY_VALUES,
       default: "public",
       index: true,
     },
@@ -75,5 +97,8 @@ postSchema.set("toJSON", {
     return ret;
   },
 });
+
+postSchema.index({ "comments.parentComment": 1 });
+postSchema.index({ "comments.author": 1 });
 
 module.exports = mongoose.model("Post", postSchema);

@@ -1,6 +1,7 @@
 const express = require("express");
 const { body, param, query } = require("express-validator");
 const multer = require("multer");
+const { env } = require("../config/env");
 const {
   completeUpload,
   deleteReel,
@@ -12,6 +13,7 @@ const {
   markReady,
   reportReel,
   seedReels,
+  signUpload,
   toggleLike,
   toggleSave,
   trackView,
@@ -20,12 +22,18 @@ const {
 } = require("../controllers/reelController");
 const { requireAuth } = require("../middlewares/auth");
 const { validateRequest } = require("../utils/validateRequest");
+const { REEL_VISIBILITY_VALUES } = require("../utils/visibility");
 
 const router = express.Router();
 const reelVideoUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 40 * 1024 * 1024 },
 });
+const applyUploadTimeout = (req, res, next) => {
+  req.setTimeout(env.REELS_UPLOAD_TIMEOUT_MS);
+  res.setTimeout(env.REELS_UPLOAD_TIMEOUT_MS);
+  next();
+};
 
 router.get(
   "/",
@@ -61,42 +69,41 @@ router.post(
       .withMessage("music must be <= 180 chars"),
     body("visibility")
       .optional({ values: "falsy" })
-      .isIn(["public", "friends", "followers", "private"])
+      .isIn(REEL_VISIBILITY_VALUES)
       .withMessage("visibility must be public/friends/private"),
-    body("fileName")
-      .optional({ values: "falsy" })
-      .isString()
-      .withMessage("fileName must be a string"),
-    body("mimeType")
-      .optional({ values: "falsy" })
-      .isString()
-      .withMessage("mimeType must be a string"),
     validateRequest,
   ],
   initiateUpload,
 );
 
 router.post(
-  "/:reelId/uploads/complete",
+  "/uploads/sign",
   requireAuth,
   [
-    param("reelId").isMongoId().withMessage("Invalid reel id"),
-    body("storageKey")
-      .optional({ values: "falsy" })
-      .isString()
-      .withMessage("storageKey must be a string"),
-    body("originalUrl")
-      .optional({ values: "falsy" })
-      .isString()
-      .withMessage("originalUrl must be a string"),
+    body("reelId").isMongoId().withMessage("Invalid reel id"),
     validateRequest,
   ],
+  signUpload,
+);
+
+const completeUploadValidators = [
+  param("reelId").isMongoId().withMessage("Invalid reel id"),
+  validateRequest,
+];
+
+router.post("/:reelId/complete", requireAuth, completeUploadValidators, completeUpload);
+
+router.post(
+  "/:reelId/uploads/complete",
+  requireAuth,
+  completeUploadValidators,
   completeUpload,
 );
 
 router.post(
   "/:reelId/uploads/local",
   requireAuth,
+  applyUploadTimeout,
   reelVideoUpload.single("video"),
   [
     param("reelId").isMongoId().withMessage("Invalid reel id"),
@@ -190,7 +197,7 @@ router.patch(
       .withMessage("music must be <= 180 chars"),
     body("visibility")
       .optional()
-      .isIn(["public", "friends", "followers", "private"])
+      .isIn(REEL_VISIBILITY_VALUES)
       .withMessage("visibility must be public/friends/private"),
     body("thumbUrl")
       .optional()

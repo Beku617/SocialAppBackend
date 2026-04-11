@@ -26,6 +26,18 @@ const reelCommentSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    repliedToUser: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true,
+    },
+    repliedToUsername: {
+      type: String,
+      default: "",
+      trim: true,
+      maxlength: 30,
+    },
     likes: [
       {
         type: mongoose.Schema.Types.ObjectId,
@@ -50,5 +62,7 @@ reelCommentSchema.set("toJSON", {
     return ret;
   },
 });
+
+reelCommentSchema.index({ reel: 1, parentComment: 1, createdAt: 1 });
 
 module.exports = mongoose.model("ReelComment", reelCommentSchema);

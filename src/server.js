@@ -10,9 +10,16 @@ const start = async () => {
     await connectDb(env.MONGODB_URI);
     await seedDevelopmentAdmin();
 
-    app.listen(env.PORT, () => {
+    const server = app.listen(env.PORT, () => {
       console.log(`Server listening on http://localhost:${env.PORT}`);
+      console.log(
+        `HTTP timeout set to ${env.SERVER_TIMEOUT_MS}ms, upload timeout set to ${env.REELS_UPLOAD_TIMEOUT_MS}ms`,
+      );
     });
+
+    server.requestTimeout = env.SERVER_TIMEOUT_MS;
+    server.headersTimeout = env.SERVER_TIMEOUT_MS + 5000;
+    server.timeout = env.SERVER_TIMEOUT_MS;
   } catch (error) {
     console.error("Failed to start server:", error.message);
     process.exit(1);

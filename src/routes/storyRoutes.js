@@ -2,6 +2,7 @@ const { Router } = require("express");
 const { body } = require("express-validator");
 const { requireAuth } = require("../middlewares/auth");
 const { validateRequest } = require("../utils/validateRequest");
+const { VISIBILITY_VALUES } = require("../utils/visibility");
 const {
   listStories,
   createStory,
@@ -29,6 +30,10 @@ router.post(
       .isString()
       .isLength({ max: 200 })
       .withMessage("Caption max 200 chars"),
+    body("visibility")
+      .optional({ values: "falsy" })
+      .isIn(VISIBILITY_VALUES)
+      .withMessage("visibility must be public/friends/private"),
     validateRequest,
   ],
   createStory,
