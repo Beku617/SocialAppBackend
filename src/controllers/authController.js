@@ -864,6 +864,68 @@ const blockUser = async (req, res, next) => {
   }
 };
 
+const getBlockedUsers = async (req, res, next) => {
+  try {
+    const blockedIds = Array.isArray(req.user.blockedUsers)
+      ? req.user.blockedUsers.map(toIdString)
+      : [];
+
+    if (blockedIds.length === 0) {
+      return res.status(200).json({ users: [] });
+    }
+
+    const blockedUsers = await User.find({
+      _id: { $in: blockedIds },
+    })
+      .select("name username avatarUrl bio")
+      .lean();
+
+    const byId = new Map(
+      blockedUsers.map((item) => [item._id.toString(), item]),
+    );
+    const users = blockedIds
+      .map((id) => byId.get(id))
+      .filter(Boolean)
+      .map((item) => ({
+        id: item._id.toString(),
+        name: item.name || "User",
+        username: item.username || "",
+        avatarUrl: item.avatarUrl || "",
+        bio: item.bio || "",
+      }));
+
+    return res.status(200).json({ users });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const unblockUser = async (req, res, next) => {
+  try {
+    const currentUserId = req.user._id.toString();
+    const targetUserId = req.params.userId;
+
+    if (currentUserId === targetUserId) {
+      throw createHttpError(400, "Cannot unblock yourself");
+    }
+
+    const targetUser = await User.findById(targetUserId).select("_id");
+    if (!targetUser) {
+      throw createHttpError(404, "User not found");
+    }
+
+    req.user.blockedUsers = removeUserId(req.user.blockedUsers, targetUserId);
+    await req.user.save();
+
+    return res.status(200).json({
+      status: "unblocked",
+      unblockedUserId: targetUserId,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getFollowers = async (req, res, next) => {
   try {
     const user = await User.findById(req.params.userId).populate(
@@ -927,6 +989,8 @@ module.exports = {
   acceptFriendRequest,
   unfriendUser,
   blockUser,
+  getBlockedUsers,
+  unblockUser,
   getFriends,
   toggleFollow,
   getFollowers,

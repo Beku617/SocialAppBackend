@@ -2,6 +2,7 @@ const Message = require("../models/Message");
 const Post = require("../models/Post");
 const Report = require("../models/Report");
 const Reel = require("../models/Reel");
+const ReelReport = require("../models/ReelReport");
 const ReelComment = require("../models/ReelComment");
 const Story = require("../models/Story");
 const User = require("../models/User");
@@ -80,6 +81,43 @@ const serializeAdminReport = (report) => ({
           ? {
               id: report.post.author._id.toString(),
               name: report.post.author.name || "Unknown",
+            }
+          : null,
+      }
+    : null,
+});
+
+const serializeAdminReelReport = (report) => ({
+  id: report._id.toString(),
+  reason: report.reason,
+  description: report.description || "",
+  status: report.status || "open",
+  createdAt: report.createdAt,
+  reporter: report.reporter
+    ? {
+        id: report.reporter._id.toString(),
+        name: report.reporter.name || "Unknown",
+        email: report.reporter.email || "",
+      }
+    : null,
+  owner: report.owner
+    ? {
+        id: report.owner._id.toString(),
+        name: report.owner.name || "Unknown",
+        email: report.owner.email || "",
+      }
+    : null,
+  reel: report.reel
+    ? {
+        id: report.reel._id.toString(),
+        caption: report.reel.caption || "",
+        thumbUrl: report.reel.thumbUrl || "",
+        playbackUrl: report.reel.playbackUrl || "",
+        status: report.reel.status || "ready",
+        author: report.reel.author
+          ? {
+              id: report.reel.author._id.toString(),
+              name: report.reel.author.name || "Unknown",
             }
           : null,
       }
@@ -597,6 +635,91 @@ const listReports = async (_req, res, next) => {
   }
 };
 
+const listReelReports = async (_req, res, next) => {
+  try {
+    const reports = await ReelReport.find()
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .populate("reporter", "name email")
+      .populate("owner", "name email")
+      .populate({
+        path: "reel",
+        select: "caption thumbUrl playbackUrl status author",
+        populate: {
+          path: "author",
+          select: "name",
+        },
+      })
+      .lean();
+
+    return res.status(200).json({
+      reports: reports.map(serializeAdminReelReport),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const dismissReelReport = async (req, res, next) => {
+  try {
+    const report = await ReelReport.findById(req.params.reportId);
+    if (!report) {
+      throw createHttpError(404, "Reel report not found");
+    }
+
+    report.status = "dismissed";
+    await report.save();
+
+    return res.status(200).json({
+      message: "Reel report dismissed",
+      report: {
+        id: report._id.toString(),
+        status: report.status,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const hideReelFromReport = async (req, res, next) => {
+  try {
+    const report = await ReelReport.findById(req.params.reportId).populate(
+      "reel",
+      "_id status failureReason",
+    );
+    if (!report) {
+      throw createHttpError(404, "Reel report not found");
+    }
+    if (!report.reel) {
+      throw createHttpError(404, "Reported reel not found");
+    }
+
+    report.reel.status = "failed";
+    report.reel.failureReason = "Hidden by admin after report";
+    await report.reel.save();
+
+    await ReelReport.updateMany(
+      { reel: report.reel._id, status: { $in: ["open", "reviewed", "dismissed"] } },
+      { $set: { status: "reel_hidden" } },
+    );
+
+    return res.status(200).json({
+      message: "Reel hidden successfully",
+      report: {
+        id: report._id.toString(),
+        status: "reel_hidden",
+      },
+      reel: {
+        id: report.reel._id.toString(),
+        status: report.reel.status,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getPostDetails = async (req, res, next) => {
   try {
     const post = await Post.findById(req.params.postId)
@@ -809,6 +932,7 @@ const deleteAdminReel = async (req, res, next) => {
 
     await Promise.all([
       ReelComment.deleteMany({ reel: reel._id }),
+      ReelReport.deleteMany({ reel: reel._id }),
       Reel.deleteOne({ _id: reel._id }),
     ]);
 
@@ -839,10 +963,13 @@ module.exports = {
   getReelDetails,
   getSummary,
   getUserDetails,
+  hideReelFromReport,
   listPosts,
+  listReelReports,
   listReports,
   listReels,
   listUsers,
   sendAdminNotification,
+  dismissReelReport,
   unbanUser,
 };

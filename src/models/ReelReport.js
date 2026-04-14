@@ -14,6 +14,12 @@ const reelReportSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    owner: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
     reason: {
       type: String,
       required: true,
@@ -36,7 +42,7 @@ const reelReportSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["open", "reviewed"],
+      enum: ["open", "reviewed", "dismissed", "reel_hidden"],
       default: "open",
       index: true,
     },

@@ -22,11 +22,18 @@ const messageSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    requestStatus: {
+      type: String,
+      enum: ["pending", "accepted"],
+      default: "accepted",
+      index: true,
+    },
   },
   { timestamps: true },
 );
 
 messageSchema.index({ sender: 1, receiver: 1, createdAt: -1 });
+messageSchema.index({ receiver: 1, requestStatus: 1, createdAt: -1 });
 
 messageSchema.set("toJSON", {
   transform: (_doc, ret) => {

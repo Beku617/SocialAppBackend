@@ -9,11 +9,14 @@ const {
   deleteAdminPost,
   deleteAdminReel,
   deleteUser,
+  dismissReelReport,
   getPostDetails,
   getReelDetails,
   getSummary,
   getUserDetails,
+  hideReelFromReport,
   listPosts,
+  listReelReports,
   listReports,
   listReels,
   listUsers,
@@ -85,6 +88,17 @@ router.delete(
 );
 
 router.get("/reports", listReports);
+router.get("/reel-reports", listReelReports);
+router.patch(
+  "/reel-reports/:reportId/dismiss",
+  [param("reportId").isMongoId().withMessage("Invalid report id"), validateRequest],
+  dismissReelReport,
+);
+router.patch(
+  "/reel-reports/:reportId/hide-reel",
+  [param("reportId").isMongoId().withMessage("Invalid report id"), validateRequest],
+  hideReelFromReport,
+);
 
 router.get("/posts", listPosts);
 router.get(

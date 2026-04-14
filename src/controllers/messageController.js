@@ -14,6 +14,14 @@ const hasUserId = (values, userId) =>
   Array.isArray(values) &&
   values.some((value) => toIdString(value) === String(userId));
 
+const areUsersFriends = (firstUser, secondUserId, secondUser) => {
+  const firstUserId = toIdString(firstUser?._id);
+  return (
+    hasUserId(firstUser?.friends, secondUserId) ||
+    hasUserId(secondUser?.friends, firstUserId)
+  );
+};
+
 const NOTES_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_NOTE_LENGTH = 120;
 
@@ -33,7 +41,10 @@ const getConversations = async (req, res, next) => {
     const messages = await Message.aggregate([
       {
         $match: {
-          $or: [{ sender: userId }, { receiver: userId }],
+          $and: [
+            { $or: [{ sender: userId }, { receiver: userId }] },
+            { requestStatus: { $ne: "pending" } },
+          ],
         },
       },
       { $sort: { createdAt: -1 } },
@@ -110,6 +121,71 @@ const getConversations = async (req, res, next) => {
   }
 };
 
+// GET /api/messages/requests — list incoming pending message requests
+const getRequests = async (req, res, next) => {
+  try {
+    const userId = req.user._id;
+    const incoming = await Message.aggregate([
+      {
+        $match: {
+          receiver: userId,
+          requestStatus: "pending",
+        },
+      },
+      { $sort: { createdAt: -1 } },
+      {
+        $group: {
+          _id: "$sender",
+          lastMessage: { $first: "$$ROOT" },
+          pendingCount: { $sum: 1 },
+        },
+      },
+      { $sort: { "lastMessage.createdAt": -1 } },
+      { $limit: 50 },
+    ]);
+
+    const senderIds = incoming.map((item) => item._id);
+    const users = await User.find({ _id: { $in: senderIds } })
+      .select("name avatarUrl bio blockedUsers")
+      .lean();
+
+    const blockedByCurrent = new Set(
+      Array.isArray(req.user.blockedUsers)
+        ? req.user.blockedUsers.map((value) => value.toString())
+        : [],
+    );
+    const usersMap = {};
+    users.forEach((user) => {
+      const senderId = user._id.toString();
+      if (blockedByCurrent.has(senderId)) return;
+      if (hasUserId(user.blockedUsers, userId.toString())) return;
+      usersMap[senderId] = {
+        id: senderId,
+        name: user.name || "User",
+        avatarUrl: user.avatarUrl || "",
+        bio: user.bio || "",
+      };
+    });
+
+    const requests = incoming
+      .filter((item) => usersMap[item._id.toString()])
+      .map((item) => ({
+        user: usersMap[item._id.toString()],
+        lastMessage: {
+          id: item.lastMessage._id.toString(),
+          text: item.lastMessage.text,
+          senderId: item.lastMessage.sender.toString(),
+          createdAt: item.lastMessage.createdAt,
+        },
+        unreadCount: item.pendingCount,
+      }));
+
+    return res.status(200).json({ requests });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 // GET /api/messages/:userId — get messages between current user and :userId
 const getMessages = async (req, res, next) => {
   try {
@@ -153,6 +229,7 @@ const getMessages = async (req, res, next) => {
       receiverId: m.receiver.toString(),
       text: m.text,
       read: m.read,
+      requestStatus: m.requestStatus || "accepted",
       createdAt: m.createdAt,
     }));
 
@@ -169,6 +246,7 @@ const getMessages = async (req, res, next) => {
 const sendMessage = async (req, res, next) => {
   try {
     const currentUserId = req.user._id;
+    const currentUserIdStr = currentUserId.toString();
     const otherUserId = req.params.userId;
     const { text } = req.body;
 
@@ -182,15 +260,58 @@ const sendMessage = async (req, res, next) => {
     }
     if (
       hasUserId(req.user.blockedUsers, otherUserId) ||
-      hasUserId(otherUser.blockedUsers, currentUserId.toString())
+      hasUserId(otherUser.blockedUsers, currentUserIdStr)
     ) {
       throw createHttpError(403, "Chat is blocked");
+    }
+
+    const usersAreFriends = areUsersFriends(req.user, otherUserId, otherUser);
+    let requestStatus = "accepted";
+
+    if (!usersAreFriends) {
+      const conversationFilter = {
+        $or: [
+          { sender: currentUserId, receiver: otherUserId },
+          { sender: otherUserId, receiver: currentUserId },
+        ],
+      };
+      const [hasAcceptedConversation, pendingOutgoing, pendingIncoming] =
+        await Promise.all([
+          Message.exists({
+            ...conversationFilter,
+            requestStatus: { $ne: "pending" },
+          }),
+          Message.exists({
+            sender: currentUserId,
+            receiver: otherUserId,
+            requestStatus: "pending",
+          }),
+          Message.exists({
+            sender: otherUserId,
+            receiver: currentUserId,
+            requestStatus: "pending",
+          }),
+        ]);
+
+      if (!hasAcceptedConversation) {
+        if (pendingOutgoing) {
+          throw createHttpError(403, "Message request is pending");
+        }
+        if (pendingIncoming) {
+          throw createHttpError(
+            403,
+            "You have a pending message request from this user",
+          );
+        }
+        requestStatus = "pending";
+      }
     }
 
     const message = await Message.create({
       sender: currentUserId,
       receiver: otherUserId,
       text: text.trim(),
+      requestStatus,
     });
 
     try {
@@ -215,7 +336,7 @@ const sendMessage = async (req, res, next) => {
         title: req.user?.name || "New message",
         body: message.text,
         data: {
-          type: "dm",
+          type: requestStatus === "pending" ? "dm_request" : "dm",
           userId: currentUserId.toString(),
           userName: req.user?.name || "",
           messageId: message._id.toString(),
@@ -237,8 +358,92 @@ const sendMessage = async (req, res, next) => {
         receiverId: message.receiver.toString(),
         text: message.text,
         read: message.read,
+        requestStatus: message.requestStatus || "accepted",
         createdAt: message.createdAt,
       },
+      requestPending: message.requestStatus === "pending",
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// POST /api/messages/requests/:userId/accept — accept incoming request from :userId
+const acceptRequest = async (req, res, next) => {
+  try {
+    const currentUserId = req.user._id;
+    const senderUserId = req.params.userId;
+
+    const sender = await User.findById(senderUserId).select("_id");
+    if (!sender) {
+      throw createHttpError(404, "User not found");
+    }
+
+    const result = await Message.updateMany(
+      {
+        sender: senderUserId,
+        receiver: currentUserId,
+        requestStatus: "pending",
+      },
+      { $set: { requestStatus: "accepted" } },
+    );
+
+    if (!result.modifiedCount) {
+      throw createHttpError(404, "Message request not found");
+    }
+
+    return res.status(200).json({
+      message: "Request accepted",
+      acceptedCount: result.modifiedCount,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// DELETE /api/messages/requests/:userId — delete incoming request from :userId
+const deleteRequest = async (req, res, next) => {
+  try {
+    const currentUserId = req.user._id;
+    const senderUserId = req.params.userId;
+
+    await Message.deleteMany({
+      sender: senderUserId,
+      receiver: currentUserId,
+      requestStatus: "pending",
+    });
+
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// POST /api/messages/requests/:userId/block — block sender + remove pending request
+const blockRequestSender = async (req, res, next) => {
+  try {
+    const currentUserId = req.user._id.toString();
+    const senderUserId = req.params.userId;
+
+    const sender = await User.findById(senderUserId).select("_id blockedUsers");
+    if (!sender) {
+      throw createHttpError(404, "User not found");
+    }
+
+    if (!hasUserId(req.user.blockedUsers, senderUserId)) {
+      req.user.blockedUsers.push(sender._id);
+      await req.user.save();
+    }
+
+    await Message.deleteMany({
+      sender: senderUserId,
+      receiver: currentUserId,
+      requestStatus: "pending",
+    });
+
+    return res.status(200).json({
+      message: "User blocked",
+      blockedUserId: senderUserId,
     });
   } catch (error) {
     return next(error);
@@ -335,8 +540,12 @@ const clearMyNote = async (req, res, next) => {
 };
 
 module.exports = {
+  acceptRequest,
+  blockRequestSender,
+  deleteRequest,
   getConversations,
   getMessages,
+  getRequests,
   getFriendNotes,
   upsertMyNote,
   clearMyNote,

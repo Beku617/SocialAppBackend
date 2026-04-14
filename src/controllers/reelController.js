@@ -938,7 +938,10 @@ const deleteReel = async (req, res, next) => {
     }
 
     await deleteCloudinaryVideo(getCloudinaryPublicIdFromReel(reel));
-    await Reel.deleteOne({ _id: reelId });
+    await Promise.all([
+      ReelReport.deleteMany({ reel: reelId }),
+      Reel.deleteOne({ _id: reelId }),
+    ]);
     return res.status(200).json({ message: "Reel deleted" });
   } catch (error) {
     return next(error);
@@ -1117,19 +1120,24 @@ const reportReel = async (req, res, next) => {
       throw createHttpError(403, "You cannot report this reel");
     }
 
+    let alreadyReported = false;
     try {
       await ReelReport.create({
         reel: reel._id,
         reporter: req.user._id,
+        owner: reel.author,
         reason,
         description,
         status: "open",
       });
     } catch (error) {
       if (error?.code !== 11000) throw error;
+      alreadyReported = true;
     }
 
-    return res.status(201).json({ message: "Reel reported" });
+    return res
+      .status(alreadyReported ? 200 : 201)
+      .json({ message: alreadyReported ? "Reel already reported" : "Reel reported" });
   } catch (error) {
     return next(error);
   }

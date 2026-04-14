@@ -1,9 +1,13 @@
 const { Router } = require("express");
 const { requireAuth } = require("../middlewares/auth");
 const {
+  acceptRequest,
+  blockRequestSender,
+  deleteRequest,
   getConversations,
   getFriendNotes,
   getMessages,
+  getRequests,
   upsertMyNote,
   clearMyNote,
   sendMessage,
@@ -13,6 +17,10 @@ const router = Router();
 
 // List all conversations
 router.get("/conversations", requireAuth, getConversations);
+router.get("/requests", requireAuth, getRequests);
+router.post("/requests/:userId/accept", requireAuth, acceptRequest);
+router.delete("/requests/:userId", requireAuth, deleteRequest);
+router.post("/requests/:userId/block", requireAuth, blockRequestSender);
 
 // Notes (friend-visible)
 router.get("/notes", requireAuth, getFriendNotes);

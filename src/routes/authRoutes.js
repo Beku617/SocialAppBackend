@@ -16,6 +16,8 @@ const {
   acceptFriendRequest,
   unfriendUser,
   blockUser,
+  unblockUser,
+  getBlockedUsers,
   getFriends,
   toggleFollow,
   getFollowers,
@@ -178,6 +180,13 @@ router.post(
   [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
   blockUser,
 );
+router.post(
+  "/users/:userId/unblock",
+  requireAuth,
+  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
+  unblockUser,
+);
+router.get("/users/me/blocked", requireAuth, getBlockedUsers);
 
 // Followers & following lists
 router.get("/users/:userId/followers", requireAuth, getFollowers);
