@@ -1,239 +1,230 @@
 const express = require("express");
-const { body, param } = require("express-validator");
+const { body, param, query } = require("express-validator");
 const {
-  banUser,
-  blockPostEdit,
-  blockReelEdit,
-  createAdminPost,
-  createAdminReel,
-  deleteAdminPost,
-  deleteAdminReel,
-  deleteUser,
-  dismissReelReport,
-  getPostDetails,
-  getReelDetails,
-  getSummary,
-  getUserDetails,
-  hideReelFromReport,
-  listPosts,
-  listReelReports,
-  listReports,
-  listReels,
+  ADMIN_NOTIFICATION_CATEGORIES,
+  getAdminSession,
+  getDashboardOverview,
+  getNotificationSettings,
+  getUserDetail,
+  listAuditLogs,
+  listNotificationHistory,
   listUsers,
-  sendAdminNotification,
-  unbanUser,
+  loginAdmin,
+  sendAdminMessagePushTest,
+  sendNotificationToAllUsers,
+  sendNotificationToSelectedUsers,
+  sendNotificationToSingleUser,
+  updateNotificationSettings,
+  updateUserStatus,
 } = require("../controllers/adminController");
-const { requireAuth, requireAdmin } = require("../middlewares/auth");
+const { requireAdmin, requireAuth } = require("../middlewares/auth");
+const { ALLOWED_NOTIFICATION_FIELDS } = require("../utils/notificationPreferences");
+const { USER_ACCOUNT_STATUSES } = require("../utils/userAccountStatus");
 const { validateRequest } = require("../utils/validateRequest");
 
 const router = express.Router();
 
-router.use(requireAuth, requireAdmin);
+const notificationSettingsValidation = ALLOWED_NOTIFICATION_FIELDS.map((field) =>
+  body(field)
+    .optional()
+    .isBoolean()
+    .withMessage(`${field} must be true or false`),
+);
 
-router.get("/summary", getSummary);
+const adminNotificationPayloadValidation = [
+  body("title")
+    .trim()
+    .isLength({ min: 1, max: 80 })
+    .withMessage("Title must be 1-80 characters"),
+  body("body")
+    .trim()
+    .isLength({ min: 1, max: 280 })
+    .withMessage("Body must be 1-280 characters"),
+  body("category")
+    .optional({ values: "falsy" })
+    .isIn(ADMIN_NOTIFICATION_CATEGORIES)
+    .withMessage(`category must be one of: ${ADMIN_NOTIFICATION_CATEGORIES.join(", ")}`),
+  body("deepLink")
+    .optional({ values: "falsy" })
+    .isString()
+    .isLength({ max: 160 })
+    .withMessage("deepLink must be 160 characters or fewer"),
+  body("deepLink")
+    .optional({ values: "falsy" })
+    .custom((value) => typeof value === "string" && value.trim().startsWith("/"))
+    .withMessage("deepLink must start with /"),
+  body("sendPush")
+    .optional()
+    .isBoolean()
+    .withMessage("sendPush must be true or false"),
+  body("clientRequestId")
+    .optional({ values: "falsy" })
+    .isString()
+    .isLength({ min: 8, max: 120 })
+    .withMessage("clientRequestId must be 8-120 characters"),
+];
+
 router.post(
-  "/notifications",
+  "/login",
   [
-    body("title")
-      .trim()
-      .isLength({ min: 1, max: 180 })
-      .withMessage("title is required (max 180 chars)"),
-    body("body")
-      .trim()
-      .isLength({ min: 1, max: 500 })
-      .withMessage("body is required (max 500 chars)"),
-    body("allUsers")
+    body("email").trim().isEmail().withMessage("Provide a valid admin email"),
+    body("password").isString().notEmpty().withMessage("Password is required"),
+    validateRequest,
+  ],
+  loginAdmin,
+);
+
+router.get("/me", requireAuth, requireAdmin, getAdminSession);
+
+router.get("/dashboard/overview", requireAuth, requireAdmin, getDashboardOverview);
+
+router.get(
+  "/users",
+  requireAuth,
+  requireAdmin,
+  [
+    query("page").optional().isInt({ min: 1 }).withMessage("page must be >= 1"),
+    query("limit")
       .optional()
-      .isBoolean()
-      .withMessage("allUsers must be boolean"),
-    body("userIds")
-      .optional()
-      .isArray({ min: 1, max: 1000 })
-      .withMessage("userIds must be a non-empty array"),
-    body("userIds.*")
-      .optional()
+      .isInt({ min: 1, max: 50 })
+      .withMessage("limit must be between 1 and 50"),
+    query("role")
+      .optional({ values: "falsy" })
+      .isIn(["user", "admin"])
+      .withMessage("role must be user or admin"),
+    query("status")
+      .optional({ values: "falsy" })
+      .isIn(USER_ACCOUNT_STATUSES)
+      .withMessage(`status must be one of: ${USER_ACCOUNT_STATUSES.join(", ")}`),
+    query("recent")
+      .optional({ values: "falsy" })
+      .isIn(["7d", "30d"])
+      .withMessage("recent must be 7d or 30d"),
+    validateRequest,
+  ],
+  listUsers,
+);
+
+router.get(
+  "/users/:id",
+  requireAuth,
+  requireAdmin,
+  [param("id").isMongoId().withMessage("Invalid user id"), validateRequest],
+  getUserDetail,
+);
+
+router.patch(
+  "/users/:id/status",
+  requireAuth,
+  requireAdmin,
+  [
+    param("id").isMongoId().withMessage("Invalid user id"),
+    body("status")
+      .isIn(USER_ACCOUNT_STATUSES)
+      .withMessage(`status must be one of: ${USER_ACCOUNT_STATUSES.join(", ")}`),
+    body("reason")
+      .optional({ values: "falsy" })
+      .isString()
+      .isLength({ max: 240 })
+      .withMessage("reason must be 240 characters or fewer"),
+    validateRequest,
+  ],
+  updateUserStatus,
+);
+
+router.get("/notification-settings", requireAuth, requireAdmin, getNotificationSettings);
+
+router.patch(
+  "/notification-settings",
+  requireAuth,
+  requireAdmin,
+  [...notificationSettingsValidation, validateRequest],
+  updateNotificationSettings,
+);
+
+router.post(
+  "/notification-settings/test-message",
+  requireAuth,
+  requireAdmin,
+  [
+    body("userId")
+      .optional({ values: "falsy" })
       .isMongoId()
-      .withMessage("Each userId must be valid"),
+      .withMessage("userId must be a valid user id"),
     validateRequest,
   ],
-  sendAdminNotification,
+  sendAdminMessagePushTest,
 );
 
-router.get("/users", listUsers);
 router.get(
-  "/users/:userId",
-  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
-  getUserDetails,
-);
-router.post(
-  "/users/:userId/ban",
+  "/notifications/history",
+  requireAuth,
+  requireAdmin,
   [
-    param("userId").isMongoId().withMessage("Invalid user id"),
-    body("duration")
-      .isIn(["1d", "3d", "7d", "30d", "forever"])
-      .withMessage("Invalid ban duration"),
+    query("page").optional().isInt({ min: 1 }).withMessage("page must be >= 1"),
+    query("limit")
+      .optional()
+      .isInt({ min: 1, max: 50 })
+      .withMessage("limit must be between 1 and 50"),
     validateRequest,
   ],
-  banUser,
-);
-router.post(
-  "/users/:userId/unban",
-  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
-  unbanUser,
-);
-router.delete(
-  "/users/:userId",
-  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
-  deleteUser,
+  listNotificationHistory,
 );
 
-router.get("/reports", listReports);
-router.get("/reel-reports", listReelReports);
-router.patch(
-  "/reel-reports/:reportId/dismiss",
-  [param("reportId").isMongoId().withMessage("Invalid report id"), validateRequest],
-  dismissReelReport,
-);
-router.patch(
-  "/reel-reports/:reportId/hide-reel",
-  [param("reportId").isMongoId().withMessage("Invalid report id"), validateRequest],
-  hideReelFromReport,
-);
-
-router.get("/posts", listPosts);
 router.get(
-  "/posts/:postId",
-  [param("postId").isMongoId().withMessage("Invalid post id"), validateRequest],
-  getPostDetails,
-);
-router.post(
-  "/posts",
+  "/audit-logs",
+  requireAuth,
+  requireAdmin,
   [
-    body("text")
+    query("page").optional().isInt({ min: 1 }).withMessage("page must be >= 1"),
+    query("limit")
       .optional()
-      .isString()
-      .isLength({ max: 2200 })
-      .withMessage("Post text must be 2200 chars or fewer"),
-    body("imageUrl")
-      .optional({ values: "falsy" })
-      .isString()
-      .withMessage("imageUrl must be a string"),
-    body("imageUrls")
-      .optional()
-      .isArray({ max: 10 })
-      .withMessage("imageUrls must be an array of up to 10 items"),
-    body("imageUrls.*")
-      .optional()
-      .isString()
-      .withMessage("Each imageUrls entry must be a string"),
-    body().custom((_value, { req }) => {
-      const text =
-        typeof req.body.text === "string" ? req.body.text.trim() : "";
-      const hasImageUrl =
-        typeof req.body.imageUrl === "string" &&
-        req.body.imageUrl.trim().length > 0;
-      const hasImageUrls =
-        Array.isArray(req.body.imageUrls) &&
-        req.body.imageUrls.some(
-          (imageUrl) =>
-            typeof imageUrl === "string" && imageUrl.trim().length > 0,
-        );
-
-      if (!text && !hasImageUrl && !hasImageUrls) {
-        throw new Error("Post must include text or at least one image");
-      }
-
-      return true;
-    }),
+      .isInt({ min: 1, max: 50 })
+      .withMessage("limit must be between 1 and 50"),
     validateRequest,
   ],
-  createAdminPost,
-);
-router.delete(
-  "/posts/:postId",
-  [param("postId").isMongoId().withMessage("Invalid post id"), validateRequest],
-  deleteAdminPost,
-);
-router.put(
-  "/posts/:postId",
-  [param("postId").isMongoId().withMessage("Invalid post id"), validateRequest],
-  blockPostEdit,
-);
-router.patch(
-  "/posts/:postId",
-  [param("postId").isMongoId().withMessage("Invalid post id"), validateRequest],
-  blockPostEdit,
+  listAuditLogs,
 );
 
-router.get("/reels", listReels);
-router.get(
-  "/reels/:reelId",
-  [param("reelId").isMongoId().withMessage("Invalid reel id"), validateRequest],
-  getReelDetails,
-);
 router.post(
-  "/reels",
+  "/notifications/send",
+  requireAuth,
+  requireAdmin,
   [
-    body("caption")
-      .optional({ values: "falsy" })
-      .isString()
-      .isLength({ max: 2200 })
-      .withMessage("caption must be <= 2200 chars"),
-    body("music")
-      .optional({ values: "falsy" })
-      .isString()
-      .isLength({ max: 180 })
-      .withMessage("music must be <= 180 chars"),
-    body("visibility")
-      .optional({ values: "falsy" })
-      .isIn(["public", "friends", "followers", "private"])
-      .withMessage("visibility must be public/friends/private"),
-    body("base64Data")
-      .isString()
-      .isLength({ min: 100 })
-      .withMessage("base64Data is required"),
-    body("mimeType")
-      .optional({ values: "falsy" })
-      .isString()
-      .withMessage("mimeType must be a string"),
-    body("fileName")
-      .optional({ values: "falsy" })
-      .isString()
-      .withMessage("fileName must be a string"),
-    body("thumbUrl")
-      .optional({ values: "falsy" })
-      .isString()
-      .withMessage("thumbUrl must be a string"),
-    body("duration")
-      .optional({ values: "falsy" })
-      .isFloat({ min: 0 })
-      .withMessage("duration must be >= 0"),
-    body("width")
-      .optional({ values: "falsy" })
-      .isInt({ min: 0 })
-      .withMessage("width must be >= 0"),
-    body("height")
-      .optional({ values: "falsy" })
-      .isInt({ min: 0 })
-      .withMessage("height must be >= 0"),
+    body("userId").isMongoId().withMessage("userId must be a valid user id"),
+    ...adminNotificationPayloadValidation,
     validateRequest,
   ],
-  createAdminReel,
+  sendNotificationToSingleUser,
 );
-router.delete(
-  "/reels/:reelId",
-  [param("reelId").isMongoId().withMessage("Invalid reel id"), validateRequest],
-  deleteAdminReel,
+
+router.post(
+  "/notifications/send-bulk",
+  requireAuth,
+  requireAdmin,
+  [
+    body("userIds")
+      .isArray({ min: 1, max: 500 })
+      .withMessage("userIds must contain 1-500 user ids"),
+    body("userIds.*").isMongoId().withMessage("Each userId must be valid"),
+    ...adminNotificationPayloadValidation,
+    validateRequest,
+  ],
+  sendNotificationToSelectedUsers,
 );
-router.put(
-  "/reels/:reelId",
-  [param("reelId").isMongoId().withMessage("Invalid reel id"), validateRequest],
-  blockReelEdit,
-);
-router.patch(
-  "/reels/:reelId",
-  [param("reelId").isMongoId().withMessage("Invalid reel id"), validateRequest],
-  blockReelEdit,
+
+router.post(
+  "/notifications/send-all",
+  requireAuth,
+  requireAdmin,
+  [
+    body("confirmAllUsers")
+      .custom((value) => value === true)
+      .withMessage("confirmAllUsers must be true"),
+    ...adminNotificationPayloadValidation,
+    validateRequest,
+  ],
+  sendNotificationToAllUsers,
 );
 
 module.exports = router;

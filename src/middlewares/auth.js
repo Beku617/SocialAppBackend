@@ -1,7 +1,11 @@
 const jwt = require("jsonwebtoken");
 const { env } = require("../config/env");
 const User = require("../models/User");
-const { ensureUserCanAccess } = require("../utils/userAccess");
+const { isAdminUser } = require("../utils/admin");
+const {
+  getUserStatusErrorMessage,
+  isUserActive,
+} = require("../utils/userAccountStatus");
 
 const requireAuth = async (req, res, next) => {
   try {
@@ -13,19 +17,26 @@ const requireAuth = async (req, res, next) => {
     }
 
     const payload = jwt.verify(token, env.JWT_SECRET);
+    if (payload?.type && payload.type !== "access") {
+      return res.status(401).json({ message: "Invalid token" });
+    }
     const user = await User.findById(payload.sub);
 
     if (!user) {
       return res.status(401).json({ message: "Invalid token" });
     }
 
-    await ensureUserCanAccess(user);
+    if (!isUserActive(user)) {
+      return res.status(403).json({
+        message: getUserStatusErrorMessage(user.accountStatus),
+      });
+    }
+
     req.user = user;
+    req.isAdmin = isAdminUser(user);
     return next();
-  } catch (error) {
-    return res
-      .status(error?.statusCode || 401)
-      .json({ message: error?.message || "Unauthorized" });
+  } catch (_error) {
+    return res.status(401).json({ message: "Unauthorized" });
   }
 };
 
@@ -34,7 +45,7 @@ const requireAdmin = (req, res, next) => {
     return res.status(401).json({ message: "Unauthorized" });
   }
 
-  if (req.user.role !== "admin") {
+  if (!req.isAdmin) {
     return res.status(403).json({ message: "Admin access required" });
   }
 

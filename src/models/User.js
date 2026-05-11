@@ -1,5 +1,42 @@
 const mongoose = require("mongoose");
 
+const recentSearchSchema = new mongoose.Schema(
+  {
+    kind: {
+      type: String,
+      enum: ["query", "user"],
+      required: true,
+    },
+    query: {
+      type: String,
+      default: "",
+      trim: true,
+      maxlength: 120,
+    },
+    targetUser: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    targetUserName: {
+      type: String,
+      default: "",
+      trim: true,
+      maxlength: 60,
+    },
+    targetUserAvatarUrl: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  { _id: true, id: false },
+);
+
 const userSchema = new mongoose.Schema(
   {
     name: {
@@ -9,13 +46,6 @@ const userSchema = new mongoose.Schema(
       minlength: 2,
       maxlength: 60,
     },
-    email: {
-      type: String,
-      required: true,
-      unique: true,
-      lowercase: true,
-      trim: true,
-    },
     username: {
       type: String,
       unique: true,
@@ -23,17 +53,60 @@ const userSchema = new mongoose.Schema(
       lowercase: true,
       trim: true,
       minlength: 3,
-      maxlength: 30,
+      maxlength: 32,
+      index: true,
+    },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
     },
     passwordHash: {
       type: String,
       required: true,
+    },
+    refreshTokenHash: {
+      type: String,
+      default: null,
+      select: false,
+    },
+    refreshTokenExpiresAt: {
+      type: Date,
+      default: null,
+      select: false,
     },
     role: {
       type: String,
       enum: ["user", "admin"],
       default: "user",
       index: true,
+    },
+    accountStatus: {
+      type: String,
+      enum: ["active", "suspended", "banned", "deactivated"],
+      default: "active",
+      index: true,
+    },
+    statusReason: {
+      type: String,
+      default: "",
+      trim: true,
+      maxlength: 240,
+    },
+    statusUpdatedAt: {
+      type: Date,
+      default: null,
+    },
+    statusUpdatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    lastLoginAt: {
+      type: Date,
+      default: null,
     },
     avatarUrl: {
       type: String,
@@ -46,54 +119,24 @@ const userSchema = new mongoose.Schema(
       maxlength: 160,
       trim: true,
     },
-    noteText: {
-      type: String,
-      default: "",
-      trim: true,
-      maxlength: 120,
-    },
-    noteUpdatedAt: {
-      type: Date,
-      default: null,
-      index: true,
-    },
-    followers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-    following: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-    friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-    blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-    friendRequestsSent: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-    friendRequestsReceived: [
-      { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-    ],
-    expoPushTokens: {
-      type: [String],
+    recentSearches: {
+      type: [recentSearchSchema],
       default: [],
     },
-    bannedAt: {
-      type: Date,
-      default: null,
-    },
-    banExpiresAt: {
-      type: Date,
-      default: null,
-    },
-    banIsPermanent: {
-      type: Boolean,
-      default: false,
-    },
+    friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+    followers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+    following: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   },
   { timestamps: true },
 );
 
 userSchema.set("toJSON", {
   transform: (_doc, ret) => {
-    ret.id = ret._id.toString();
+    ret.id =
+      ret?._id?.toString?.() || ret?.id?.toString?.() || "";
     delete ret._id;
     delete ret.__v;
     delete ret.passwordHash;
-    delete ret.expoPushTokens;
-    delete ret.noteText;
-    delete ret.noteUpdatedAt;
     return ret;
   },
 });

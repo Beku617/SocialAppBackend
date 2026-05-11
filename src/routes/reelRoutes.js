@@ -1,19 +1,15 @@
 const express = require("express");
 const { body, param, query } = require("express-validator");
-const multer = require("multer");
-const { env } = require("../config/env");
 const {
   completeUpload,
   deleteReel,
+  getReel,
   initiateUpload,
   listMyReels,
-  listSavedReels,
   listReels,
   markFailed,
   markReady,
-  reportReel,
   seedReels,
-  signUpload,
   toggleLike,
   toggleSave,
   trackView,
@@ -22,18 +18,8 @@ const {
 } = require("../controllers/reelController");
 const { requireAuth } = require("../middlewares/auth");
 const { validateRequest } = require("../utils/validateRequest");
-const { REEL_VISIBILITY_VALUES } = require("../utils/visibility");
 
 const router = express.Router();
-const reelVideoUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 40 * 1024 * 1024 },
-});
-const applyUploadTimeout = (req, res, next) => {
-  req.setTimeout(env.REELS_UPLOAD_TIMEOUT_MS);
-  res.setTimeout(env.REELS_UPLOAD_TIMEOUT_MS);
-  next();
-};
 
 router.get(
   "/",
@@ -49,7 +35,12 @@ router.get(
 );
 
 router.get("/mine", requireAuth, listMyReels);
-router.get("/saved", requireAuth, listSavedReels);
+router.get(
+  "/:reelId",
+  requireAuth,
+  [param("reelId").isMongoId().withMessage("Invalid reel id"), validateRequest],
+  getReel,
+);
 
 router.post("/seed", requireAuth, seedReels);
 
@@ -69,54 +60,48 @@ router.post(
       .withMessage("music must be <= 180 chars"),
     body("visibility")
       .optional({ values: "falsy" })
-      .isIn(REEL_VISIBILITY_VALUES)
-      .withMessage("visibility must be public/friends/private"),
+      .isIn(["public", "followers", "private"])
+      .withMessage("visibility must be public/followers/private"),
+    body("fileName")
+      .optional({ values: "falsy" })
+      .isString()
+      .withMessage("fileName must be a string"),
+    body("mimeType")
+      .optional({ values: "falsy" })
+      .isString()
+      .withMessage("mimeType must be a string"),
     validateRequest,
   ],
   initiateUpload,
 );
 
 router.post(
-  "/uploads/sign",
-  requireAuth,
-  [
-    body("reelId").isMongoId().withMessage("Invalid reel id"),
-    validateRequest,
-  ],
-  signUpload,
-);
-
-const completeUploadValidators = [
-  param("reelId").isMongoId().withMessage("Invalid reel id"),
-  validateRequest,
-];
-
-router.post("/:reelId/complete", requireAuth, completeUploadValidators, completeUpload);
-
-router.post(
   "/:reelId/uploads/complete",
   requireAuth,
-  completeUploadValidators,
+  [
+    param("reelId").isMongoId().withMessage("Invalid reel id"),
+    body("storageKey")
+      .optional({ values: "falsy" })
+      .isString()
+      .withMessage("storageKey must be a string"),
+    body("originalUrl")
+      .optional({ values: "falsy" })
+      .isString()
+      .withMessage("originalUrl must be a string"),
+    validateRequest,
+  ],
   completeUpload,
 );
 
 router.post(
   "/:reelId/uploads/local",
   requireAuth,
-  applyUploadTimeout,
-  reelVideoUpload.single("video"),
   [
     param("reelId").isMongoId().withMessage("Invalid reel id"),
-    body().custom((_, { req }) => {
-      const hasMultipartVideo = Boolean(req.file?.buffer?.length);
-      const base64Data = typeof req.body?.base64Data === "string"
-        ? req.body.base64Data.trim()
-        : "";
-      if (!hasMultipartVideo && base64Data.length < 100) {
-        throw new Error("Provide either multipart video file or base64Data");
-      }
-      return true;
-    }),
+    body("base64Data")
+      .isString()
+      .isLength({ min: 100 })
+      .withMessage("base64Data is required"),
     body("mimeType")
       .optional({ values: "falsy" })
       .isString()
@@ -197,8 +182,8 @@ router.patch(
       .withMessage("music must be <= 180 chars"),
     body("visibility")
       .optional()
-      .isIn(REEL_VISIBILITY_VALUES)
-      .withMessage("visibility must be public/friends/private"),
+      .isIn(["public", "followers", "private"])
+      .withMessage("visibility must be public/followers/private"),
     body("thumbUrl")
       .optional()
       .isString()
@@ -234,33 +219,6 @@ router.post(
   requireAuth,
   [param("reelId").isMongoId().withMessage("Invalid reel id"), validateRequest],
   trackView,
-);
-
-router.post(
-  "/:reelId/report",
-  requireAuth,
-  [
-    param("reelId").isMongoId().withMessage("Invalid reel id"),
-    body("reason")
-      .optional({ values: "falsy" })
-      .isIn([
-        "spam",
-        "harassment",
-        "hate_speech",
-        "violence",
-        "nudity",
-        "false_information",
-        "other",
-      ])
-      .withMessage("Invalid report reason"),
-    body("description")
-      .optional({ values: "falsy" })
-      .isString()
-      .isLength({ max: 500 })
-      .withMessage("description must be <= 500 chars"),
-    validateRequest,
-  ],
-  reportReel,
 );
 
 module.exports = router;

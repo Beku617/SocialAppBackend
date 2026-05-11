@@ -3,7 +3,19 @@ const ReelComment = require("../models/ReelComment");
 const Reel = require("../models/Reel");
 const User = require("../models/User");
 const { createHttpError } = require("../utils/httpError");
-const { createUserNotification } = require("../utils/notificationCenter");
+const {
+  buildVisibleAppUserQuery,
+  filterVisibleMentions,
+  isVisibleUserId,
+} = require("../utils/contentVisibility");
+const {
+  createNotification,
+  deleteNotifications,
+} = require("../utils/notifications");
+const {
+  mapCommentMentions,
+  normalizeCommentMentions,
+} = require("../utils/commentMentions");
 
 const toIdString = (value) => {
   if (!value) return "";
@@ -23,16 +35,10 @@ const mapComment = (comment, currentUserId) => {
       avatarUrl: comment.author?.avatarUrl || "",
     },
     text: comment.text,
+    mentions: mapCommentMentions(comment.mentions || []),
     parentCommentId: comment.parentComment
       ? comment.parentComment.toString()
       : null,
-    repliedToUserId: comment.repliedToUser
-      ? comment.repliedToUser.toString()
-      : "",
-    repliedToUsername:
-      typeof comment.repliedToUsername === "string"
-        ? comment.repliedToUsername
-        : "",
     likesCount: comment.likes?.length || 0,
     dislikesCount: comment.dislikes?.length || 0,
     likedByMe: Array.isArray(comment.likes)
@@ -63,12 +69,33 @@ const getComments = async (req, res, next) => {
       throw createHttpError(404, "Reel not found");
     }
 
+    if (!(await isVisibleUserId(User, reel.author))) {
+      throw createHttpError(404, "Reel not found");
+    }
+
     const comments = await ReelComment.find({ reel: reelId })
       .sort({ createdAt: 1 })
-      .populate("author", "name avatarUrl")
+      .populate("author", "name avatarUrl role accountStatus")
+      .populate("mentions.user", "name avatarUrl role accountStatus")
       .lean();
 
-    const mapped = comments.map((c) => mapComment(c, currentUserId));
+    const visibleAuthorIds = new Set(
+      (
+        await User.distinct("_id", {
+          _id: { $in: comments.map((comment) => comment.author).filter(Boolean) },
+          ...buildVisibleAppUserQuery(),
+        })
+      ).map((id) => id.toString()),
+    );
+
+    const visibleComments = comments
+      .filter((comment) => visibleAuthorIds.has(toIdString(comment.author)))
+      .map((comment) => ({
+        ...comment,
+        mentions: filterVisibleMentions(comment.mentions || []),
+      }));
+
+    const mapped = visibleComments.map((c) => mapComment(c, currentUserId));
 
     // Build nested tree
     const commentMap = {};
@@ -114,6 +141,10 @@ const addComment = async (req, res, next) => {
       throw createHttpError(404, "Reel not found");
     }
 
+    if (!(await isVisibleUserId(User, reel.author))) {
+      throw createHttpError(404, "Reel not found");
+    }
+
     const text =
       typeof req.body.text === "string" ? req.body.text.trim() : "";
     if (!text || text.length > 500) {
@@ -123,36 +154,29 @@ const addComment = async (req, res, next) => {
       );
     }
 
+    const mentions = await normalizeCommentMentions(req.body?.mentions, text);
+
     const parentCommentId = req.body.parentCommentId || null;
     let parent = null;
-    let repliedToUserId = "";
-    let repliedToUsername = "";
     if (parentCommentId) {
       if (!mongoose.Types.ObjectId.isValid(parentCommentId)) {
         throw createHttpError(400, "Invalid parent comment id");
       }
-      parent = await ReelComment.findById(parentCommentId)
-        .populate("author", "username name")
-        .lean();
+      parent = await ReelComment.findById(parentCommentId);
       if (!parent || parent.reel.toString() !== reelId) {
         throw createHttpError(404, "Parent comment not found");
       }
-
-      repliedToUserId = toIdString(parent.author);
-      repliedToUsername =
-        parent.author?.username ||
-        parent.author?.name ||
-        req.body?.repliedToUsername ||
-        "";
+      if (!(await isVisibleUserId(User, parent.author))) {
+        throw createHttpError(404, "Parent comment not found");
+      }
     }
 
     const comment = await ReelComment.create({
       reel: reelId,
       author: currentUserId,
       text,
+      mentions,
       parentComment: parentCommentId,
-      repliedToUser: repliedToUserId || null,
-      repliedToUsername,
     });
 
     // Update reel commentsCount
@@ -160,78 +184,29 @@ const addComment = async (req, res, next) => {
     reel.commentsCount = totalCount;
     await reel.save();
 
-    const reelAuthorId = reel.author.toString();
-    if (reelAuthorId !== currentUserId) {
-      try {
-        const reelAuthor = await User.findById(reelAuthorId).select(
-          "expoPushTokens",
-        );
-        await createUserNotification({
-          userId: reelAuthorId,
-          type: "reel_comment",
-          title: `${req.user?.name || "Someone"} commented on your reel`,
-          body: text.slice(0, 160) || "Someone commented on your reel.",
-          data: {
-            type: "reel_comment",
-            reelId: reel._id.toString(),
-            commentId: comment._id.toString(),
-            actorId: currentUserId,
-            actorName: req.user?.name || "",
-          },
-          push: {
-            enabled: true,
-            tokens: reelAuthor?.expoPushTokens || [],
-            channelId: "messages",
-          },
-        });
-      } catch (notificationError) {
-        console.warn(
-          "[reel_comment] notification dispatch failed:",
-          notificationError,
-        );
-      }
-    }
-
-    if (
-      repliedToUserId &&
-      repliedToUserId !== currentUserId &&
-      repliedToUserId !== reelAuthorId
-    ) {
-      try {
-        const repliedUser = await User.findById(repliedToUserId).select(
-          "expoPushTokens",
-        );
-        await createUserNotification({
-          userId: repliedToUserId,
-          type: "reel_comment",
-          title: `${req.user?.name || "Someone"} replied to your comment`,
-          body: text.slice(0, 160) || "Someone replied to your comment.",
-          data: {
-            type: "reel_comment",
-            reelId: reel._id.toString(),
-            commentId: comment._id.toString(),
-            actorId: currentUserId,
-            actorName: req.user?.name || "",
-            isReply: true,
-          },
-          push: {
-            enabled: true,
-            tokens: repliedUser?.expoPushTokens || [],
-            channelId: "messages",
-          },
-        });
-      } catch (notificationError) {
-        console.warn(
-          "[reel_reply] notification dispatch failed:",
-          notificationError,
-        );
-      }
-    }
-
-    await comment.populate("author", "name avatarUrl");
+    await comment.populate("author", "name avatarUrl role accountStatus");
+    await comment.populate("mentions.user", "name avatarUrl role accountStatus");
+    comment.mentions = filterVisibleMentions(comment.mentions || []);
 
     const mapped = mapComment(comment, currentUserId);
     mapped.replies = [];
+
+    if (parent) {
+      await createNotification({
+        recipientId: parent.author,
+        actor: req.user,
+        type: "reply_reel_comment",
+        reelId: reel._id,
+        referenceId: comment._id.toString(),
+        message: "replied to your reel comment.",
+        deepLink: `/reels/${reel._id.toString()}`,
+        push: {
+          eventType: "reply_reel_comment",
+          title: `${req.user.name} replied to your reel comment`,
+          body: text,
+        },
+      });
+    }
 
     return res.status(201).json({
       comment: mapped,
@@ -250,6 +225,15 @@ const likeComment = async (req, res, next) => {
 
     const comment = await ReelComment.findById(commentId);
     if (!comment) {
+      throw createHttpError(404, "Comment not found");
+    }
+
+    if (!(await isVisibleUserId(User, comment.author))) {
+      throw createHttpError(404, "Comment not found");
+    }
+
+    const reel = await Reel.findById(comment.reel).select("author");
+    if (!reel || !(await isVisibleUserId(User, reel.author))) {
       throw createHttpError(404, "Comment not found");
     }
 
@@ -294,6 +278,15 @@ const dislikeComment = async (req, res, next) => {
       throw createHttpError(404, "Comment not found");
     }
 
+    if (!(await isVisibleUserId(User, comment.author))) {
+      throw createHttpError(404, "Comment not found");
+    }
+
+    const reel = await Reel.findById(comment.reel).select("author");
+    if (!reel || !(await isVisibleUserId(User, reel.author))) {
+      throw createHttpError(404, "Comment not found");
+    }
+
     const dislikeIndex = comment.dislikes.findIndex(
       (id) => id.toString() === userId,
     );
@@ -334,14 +327,20 @@ const deleteComment = async (req, res, next) => {
     if (!comment) {
       throw createHttpError(404, "Comment not found");
     }
+    if (!(await isVisibleUserId(User, comment.author))) {
+      throw createHttpError(404, "Comment not found");
+    }
     if (comment.author.toString() !== userId) {
       throw createHttpError(403, "You can only delete your own comments");
     }
 
     // Delete comment and all its descendants
+    const deletedIds = new Set([comment._id.toString()]);
+
     const deleteDescendants = async (parentId) => {
       const children = await ReelComment.find({ parentComment: parentId });
       for (const child of children) {
+        deletedIds.add(child._id.toString());
         await deleteDescendants(child._id);
         await ReelComment.deleteOne({ _id: child._id });
       }
@@ -353,6 +352,11 @@ const deleteComment = async (req, res, next) => {
     // Update reel commentsCount
     const totalCount = await ReelComment.countDocuments({ reel: reelId });
     await Reel.findByIdAndUpdate(reelId, { commentsCount: totalCount });
+    await deleteNotifications({
+      reel: reelId,
+      referenceId: { $in: [...deletedIds] },
+      type: "reply_reel_comment",
+    });
 
     return res.status(200).json({
       message: "Comment deleted",

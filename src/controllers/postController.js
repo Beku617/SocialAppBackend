@@ -1,99 +1,132 @@
 const mongoose = require("mongoose");
 const Post = require("../models/Post");
-const Report = require("../models/Report");
 const User = require("../models/User");
 const { createHttpError } = require("../utils/httpError");
-const { normalizeImageUrls, serializePost } = require("../utils/serializePost");
-const { createUserNotification } = require("../utils/notificationCenter");
-const {
-  canViewerSeeContent,
-  normalizeVisibilityInput,
-} = require("../utils/visibility");
 const bcrypt = require("bcryptjs");
+const {
+  deleteNotifications,
+  replaceNotification,
+  createNotification,
+} = require("../utils/notifications");
+const {
+  mapCommentMentions,
+  normalizeCommentMentions,
+} = require("../utils/commentMentions");
+const {
+  buildVisibleAppUserQuery,
+  filterVisibleEmbeddedComments,
+  filterVisibleMentions,
+  isVisibleUserId,
+} = require("../utils/contentVisibility");
 
-const toIdString = (value) => {
-  if (!value) return "";
-  if (typeof value === "string") return value;
-  if (value._id) return value._id.toString();
-  return value.toString();
+const mapComment = (comment) => ({
+  id: comment._id.toString(),
+  author: comment.author
+    ? {
+        id: comment.author._id.toString(),
+        name: comment.author.name,
+        avatarUrl: comment.author.avatarUrl || "",
+      }
+    : {
+        id: "",
+        name: "Unknown",
+        avatarUrl: "",
+      },
+  text: comment.text,
+  mentions: mapCommentMentions(comment.mentions || []),
+  parentCommentId: comment.parentComment
+    ? comment.parentComment.toString()
+    : null,
+  createdAt: comment.createdAt,
+});
+
+const getVisibleAuthorIds = async () =>
+  User.distinct("_id", buildVisibleAppUserQuery());
+
+const serializeAuthor = (author) => {
+  if (!author) return null;
+  return {
+    id: author._id?.toString?.() || author.id?.toString?.() || "",
+    name: author.name || "",
+    avatarUrl: author.avatarUrl || "",
+  };
 };
 
-const normalizePostVisibility = (value) => {
-  return normalizeVisibilityInput(value, { errorMessage: "Invalid post visibility" });
+const serializeMention = (mention) => ({
+  userId:
+    mention.user?._id?.toString?.() ||
+    mention.user?.id?.toString?.() ||
+    mention.user?.toString?.() ||
+    "",
+  name: mention.name || mention.user?.name || "",
+  avatarUrl: mention.user?.avatarUrl || "",
+  start: mention.start,
+  end: mention.end,
+});
+
+const serializeComment = (comment) => ({
+  id: comment._id?.toString?.() || comment.id?.toString?.() || "",
+  author: serializeAuthor(comment.author),
+  text: comment.text || "",
+  mentions: Array.isArray(comment.mentions)
+    ? comment.mentions.map(serializeMention)
+    : [],
+  parentCommentId: comment.parentComment
+    ? comment.parentComment.toString()
+    : null,
+  createdAt: comment.createdAt,
+});
+
+const normalizePostImages = (post) => {
+  const imageUrls = Array.isArray(post.imageUrls)
+    ? post.imageUrls.filter(
+        (url) => typeof url === "string" && url.trim().length > 0,
+      )
+    : [];
+  const rawUrl =
+    typeof post.imageUrl === "string" && post.imageUrl.trim().length > 0
+      ? post.imageUrl.trim()
+      : "";
+
+  // Merge legacy single imageUrl into the array when the array is empty
+  const merged = imageUrls.length > 0 ? imageUrls : rawUrl ? [rawUrl] : [];
+
+  return {
+    imageUrl: merged[0] || "",
+    imageUrls: merged,
+  };
 };
 
-const buildFriendIdSet = (user) =>
-  new Set(Array.isArray(user?.friends) ? user.friends.map(toIdString) : []);
+const serializePost = (post) => {
+  const { imageUrl, imageUrls } = normalizePostImages(post);
 
-const buildBlockedIdSet = (user) =>
-  new Set(
-    Array.isArray(user?.blockedUsers) ? user.blockedUsers.map(toIdString) : [],
-  );
-
-const isBlockedAuthor = (post, blockedIdSet) =>
-  blockedIdSet.has(toIdString(post?.author));
-
-const canViewerSeePost = (post, viewerId, friendIdSet) => {
-  return canViewerSeeContent({
-    visibility: post?.visibility,
-    authorId: toIdString(post?.author),
-    viewerId,
-    friendIdSet,
-  });
+  return {
+    id: post._id?.toString?.() || post.id?.toString?.() || "",
+    author: serializeAuthor(post.author),
+    text: post.text || "",
+    imageUrl,
+    imageUrls,
+    likes: (post.likes || []).map((l) => l?.toString?.() || l || ""),
+    comments: filterVisibleEmbeddedComments(post.comments || []).map(
+      serializeComment,
+    ),
+    createdAt: post.createdAt,
+    updatedAt: post.updatedAt,
+  };
 };
 
-const flattenComments = (comments) => {
-  if (!Array.isArray(comments) || comments.length === 0) return [];
-  const stack = [...comments];
-  const result = [];
-  while (stack.length) {
-    const next = stack.shift();
-    result.push(next);
-    if (Array.isArray(next?.replies) && next.replies.length > 0) {
-      stack.unshift(...next.replies);
-    }
-  }
-  return result;
-};
-
-const listPosts = async (req, res, next) => {
+const listPosts = async (_req, res, next) => {
   try {
-    const viewerId = req.user._id.toString();
-    const friendIdSet = buildFriendIdSet(req.user);
-    const blockedIdSet = buildBlockedIdSet(req.user);
-    const posts = await Post.find()
+    const visibleAuthorIds = await getVisibleAuthorIds();
+    const posts = await Post.find({ author: { $in: visibleAuthorIds } })
       .sort({ createdAt: -1 })
       .limit(50)
       .populate("author", "name avatarUrl")
-      .populate({
-        path: "sharedPost",
-        populate: {
-          path: "author",
-          select: "name avatarUrl",
-        },
-      })
-      .populate("comments.author", "name avatarUrl")
+      .populate("comments.author", "name avatarUrl role accountStatus")
+      .populate("comments.mentions.user", "name avatarUrl role accountStatus")
       .lean();
 
-    const visiblePosts = posts
-      .filter(
-        (post) =>
-          !isBlockedAuthor(post, blockedIdSet) &&
-          canViewerSeePost(post, viewerId, friendIdSet),
-      )
-      .map((post) => {
-        if (
-          post.sharedPost &&
-          !canViewerSeePost(post.sharedPost, viewerId, friendIdSet)
-        ) {
-          post.sharedPost = null;
-        }
-        return post;
-      });
-
-    return res.status(200).json({
-      posts: visiblePosts.map((post) => serializePost(post, viewerId)),
-    });
+    return res.status(200).json({ posts: posts.map(serializePost) });
   } catch (error) {
     return next(error);
   }
@@ -101,41 +134,48 @@ const listPosts = async (req, res, next) => {
 
 const getPost = async (req, res, next) => {
   try {
-    const { postId } = req.params;
-    const viewerId = req.user._id.toString();
-    const friendIdSet = buildFriendIdSet(req.user);
-    const blockedIdSet = buildBlockedIdSet(req.user);
-    const post = await Post.findById(postId)
+    const visibleAuthorIds = await getVisibleAuthorIds();
+    const post = await Post.findOne({
+      _id: req.params.postId,
+      author: { $in: visibleAuthorIds },
+    })
       .populate("author", "name avatarUrl")
-      .populate({
-        path: "sharedPost",
-        populate: {
-          path: "author",
-          select: "name avatarUrl",
-        },
-      })
-      .populate("comments.author", "name avatarUrl")
+      .populate("comments.author", "name avatarUrl role accountStatus")
+      .populate("comments.mentions.user", "name avatarUrl role accountStatus")
       .lean();
 
     if (!post) {
       throw createHttpError(404, "Post not found");
     }
 
-    if (!canViewerSeePost(post, viewerId, friendIdSet)) {
-      throw createHttpError(403, "You cannot view this post");
-    }
-    if (isBlockedAuthor(post, blockedIdSet)) {
+    return res.status(200).json({ post: serializePost(post) });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getComments = async (req, res, next) => {
+  try {
+    const { postId } = req.params;
+    const visibleAuthorIds = await getVisibleAuthorIds();
+    const post = await Post.findOne({
+      _id: postId,
+      author: { $in: visibleAuthorIds },
+    })
+      .populate("comments.author", "name avatarUrl role accountStatus")
+      .populate("comments.mentions.user", "name avatarUrl role accountStatus")
+      .lean({ virtuals: false });
+
+    if (!post) {
       throw createHttpError(404, "Post not found");
     }
 
-    if (
-      post.sharedPost &&
-      !canViewerSeePost(post.sharedPost, viewerId, friendIdSet)
-    ) {
-      post.sharedPost = null;
-    }
+    const visibleComments = filterVisibleEmbeddedComments(post.comments || []).map(mapComment);
 
-    return res.status(200).json({ post: serializePost(post, viewerId) });
+    return res.status(200).json({
+      comments: visibleComments,
+      commentsCount: visibleComments.length,
+    });
   } catch (error) {
     return next(error);
   }
@@ -143,91 +183,34 @@ const getPost = async (req, res, next) => {
 
 const createPost = async (req, res, next) => {
   try {
-    const text = typeof req.body.text === "string" ? req.body.text.trim() : "";
-    const imageUrls = normalizeImageUrls(req.body);
-    const visibility = normalizePostVisibility(req.body.visibility);
+    const text = typeof req.body?.text === "string" ? req.body.text : "";
 
-    if (imageUrls.length === 0) {
-      throw createHttpError(400, "Post must include at least one image");
+    const rawImageUrls = Array.isArray(req.body?.imageUrls)
+      ? req.body.imageUrls
+      : [];
+    const imageUrls = rawImageUrls
+      .map((u) => (typeof u === "string" ? u.trim() : ""))
+      .filter((u) => u.length > 0)
+      .slice(0, 10);
+
+    const singleImageUrl =
+      typeof req.body?.imageUrl === "string" ? req.body.imageUrl.trim() : "";
+
+    if (!imageUrls.length && singleImageUrl) {
+      imageUrls.push(singleImageUrl);
     }
 
     const post = await Post.create({
       author: req.user._id,
       text,
-      imageUrl: imageUrls[0] || "",
+      imageUrl: imageUrls[0] || singleImageUrl || "",
       imageUrls,
-      visibility,
       likes: [],
       comments: [],
-      notificationsEnabled: true,
     });
 
-    const createdPost = await Post.findById(post._id)
-      .populate("author", "name avatarUrl")
-      .populate({
-        path: "sharedPost",
-        populate: {
-          path: "author",
-          select: "name avatarUrl",
-        },
-      })
-      .populate("comments.author", "name avatarUrl")
-      .lean();
-
-    return res.status(201).json({
-      post: serializePost(createdPost, req.user._id.toString()),
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const updatePost = async (req, res, next) => {
-  try {
-    const { postId } = req.params;
-    const text = typeof req.body.text === "string" ? req.body.text.trim() : "";
-    const imageUrls = normalizeImageUrls(req.body);
-    const nextVisibility =
-      req.body.visibility !== undefined
-        ? normalizePostVisibility(req.body.visibility)
-        : null;
-    const post = await Post.findById(postId);
-
-    if (!post) {
-      throw createHttpError(404, "Post not found");
-    }
-
-    if (post.author.toString() !== req.user._id.toString()) {
-      throw createHttpError(403, "You can edit only your own posts");
-    }
-
-    if (imageUrls.length === 0) {
-      throw createHttpError(400, "Post must include at least one image");
-    }
-
-    post.text = text;
-    post.imageUrl = imageUrls[0] || "";
-    post.imageUrls = imageUrls;
-    if (nextVisibility) {
-      post.visibility = nextVisibility;
-    }
-    await post.save();
-
-    const updatedPost = await Post.findById(postId)
-      .populate("author", "name avatarUrl")
-      .populate({
-        path: "sharedPost",
-        populate: {
-          path: "author",
-          select: "name avatarUrl",
-        },
-      })
-      .populate("comments.author", "name avatarUrl")
-      .lean();
-
-    return res.status(200).json({
-      post: serializePost(updatedPost, req.user._id.toString()),
-    });
+    await post.populate("author", "name avatarUrl");
+    return res.status(201).json({ post });
   } catch (error) {
     return next(error);
   }
@@ -237,19 +220,14 @@ const toggleLike = async (req, res, next) => {
   try {
     const { postId } = req.params;
     const userId = req.user._id.toString();
-    const friendIdSet = buildFriendIdSet(req.user);
-    const blockedIdSet = buildBlockedIdSet(req.user);
     const post = await Post.findById(postId);
 
     if (!post) {
       throw createHttpError(404, "Post not found");
     }
 
-    if (!canViewerSeePost(post, userId, friendIdSet)) {
-      throw createHttpError(403, "You cannot interact with this post");
-    }
-    if (isBlockedAuthor(post, blockedIdSet)) {
-      throw createHttpError(403, "Action not allowed");
+    if (!(await isVisibleUserId(User, post.author))) {
+      throw createHttpError(404, "Post not found");
     }
 
     const currentIndex = post.likes.findIndex((id) => id.toString() === userId);
@@ -263,29 +241,33 @@ const toggleLike = async (req, res, next) => {
 
     await post.save();
 
-    const authorId = post.author.toString();
-    if (liked && authorId !== userId) {
-      const postAuthor = await User.findById(authorId).select(
-        "expoPushTokens",
-      );
-      await createUserNotification({
-        userId: authorId,
-        type: "post_like",
-        title: `${req.user?.name || "Someone"} liked your post`,
-        body: post.text
-          ? post.text.slice(0, 120)
-          : "Someone reacted to your post.",
-        data: {
-          type: "post_like",
-          postId: post._id.toString(),
-          actorId: userId,
-          actorName: req.user?.name || "",
+    if (liked) {
+      await replaceNotification({
+        filter: {
+          recipient: post.author,
+          actor: req.user._id,
+          type: "like_post",
+          post: post._id,
         },
+        recipientId: post.author,
+        actor: req.user,
+        type: "like_post",
+        postId: post._id,
+        referenceId: post._id.toString(),
+        message: "liked your post.",
+        deepLink: `/posts/${post._id.toString()}`,
         push: {
-          enabled: post.notificationsEnabled !== false,
-          tokens: postAuthor?.expoPushTokens || [],
-          channelId: "messages",
+          eventType: "like_post",
+          title: `${req.user.name} liked your post`,
+          body: "Tap to open the post.",
         },
+      });
+    } else {
+      await deleteNotifications({
+        recipient: post.author,
+        actor: req.user._id,
+        type: "like_post",
+        post: post._id,
       });
     }
 
@@ -301,161 +283,101 @@ const toggleLike = async (req, res, next) => {
 const addComment = async (req, res, next) => {
   try {
     const { postId } = req.params;
-    const text = String(req.body?.text || "").trim();
-    const parentCommentId =
-      typeof req.body?.parentCommentId === "string" &&
-      req.body.parentCommentId.trim()
-        ? req.body.parentCommentId.trim()
-        : "";
-    const userId = req.user._id.toString();
-    const friendIdSet = buildFriendIdSet(req.user);
-    const blockedIdSet = buildBlockedIdSet(req.user);
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    const requestedParentCommentId = req.body?.parentCommentId || null;
     const post = await Post.findById(postId);
 
     if (!post) {
       throw createHttpError(404, "Post not found");
     }
 
-    if (!canViewerSeePost(post, userId, friendIdSet)) {
-      throw createHttpError(403, "You cannot comment on this post");
-    }
-    if (isBlockedAuthor(post, blockedIdSet)) {
-      throw createHttpError(403, "Action not allowed");
+    if (!(await isVisibleUserId(User, post.author))) {
+      throw createHttpError(404, "Post not found");
     }
 
+    if (!text || text.length > 500) {
+      throw createHttpError(400, "Comment must be 1-500 chars");
+    }
+
+    const mentions = await normalizeCommentMentions(req.body?.mentions, text);
+
+    let normalizedParentCommentId = null;
     let parentComment = null;
-    let repliedToUserId = "";
-    let repliedToUsername = "";
-
-    if (parentCommentId) {
-      if (!mongoose.Types.ObjectId.isValid(parentCommentId)) {
-        throw createHttpError(400, "Invalid parent comment id");
-      }
-      parentComment = post.comments.id(parentCommentId);
+    if (requestedParentCommentId) {
+      parentComment = post.comments.id(requestedParentCommentId);
       if (!parentComment) {
         throw createHttpError(404, "Parent comment not found");
       }
 
-      repliedToUserId = parentComment.author?.toString?.() || "";
-      if (repliedToUserId) {
-        const repliedUser = await User.findById(repliedToUserId).select(
-          "username name",
-        );
-        repliedToUsername =
-          repliedUser?.username ||
-          repliedUser?.name ||
-          req.body?.repliedToUsername ||
-          "";
+      if (!(await isVisibleUserId(User, parentComment.author))) {
+        throw createHttpError(404, "Parent comment not found");
       }
+
+      normalizedParentCommentId = parentComment.parentComment
+        ? parentComment.parentComment.toString()
+        : parentComment._id.toString();
     }
 
-    const newCommentId = new mongoose.Types.ObjectId();
     post.comments.push({
-      _id: newCommentId,
       author: req.user._id,
       text,
-      parentComment: parentComment?._id || null,
-      repliedToUser: repliedToUserId || null,
-      repliedToUsername,
-      likes: [],
+      mentions,
+      parentComment: normalizedParentCommentId,
     });
     await post.save();
-    await post.populate("comments.author", "name avatarUrl");
+    await post.populate("comments.author", "name avatarUrl role accountStatus");
+    await post.populate("comments.mentions.user", "name avatarUrl role accountStatus");
 
-    const serializedPost = serializePost(post, userId);
-    const serializedComments = flattenComments(serializedPost.comments);
-    const comment =
-      serializedComments.find((item) => item.id === newCommentId.toString()) ||
-      null;
-
-    const authorId = post.author.toString();
-    const actorId = req.user._id.toString();
-    if (authorId !== actorId) {
-      const postAuthor = await User.findById(authorId).select(
-        "expoPushTokens",
-      );
-      await createUserNotification({
-        userId: authorId,
-        type: "post_comment",
-        title: `${req.user?.name || "Someone"} commented on your post`,
-        body: text.slice(0, 160) || "Someone commented on your post.",
-        data: {
-          type: "post_comment",
-          postId: post._id.toString(),
-          commentId: newCommentId.toString(),
-          actorId,
-          actorName: req.user?.name || "",
-        },
+    const comment = post.comments[post.comments.length - 1];
+    comment.mentions = filterVisibleMentions(comment.mentions || []);
+    if (normalizedParentCommentId && parentComment) {
+      await createNotification({
+        recipientId: parentComment.author,
+        actor: req.user,
+        type: "reply_comment",
+        postId: post._id,
+        referenceId: comment._id.toString(),
+        message: "replied to your comment.",
+        deepLink: `/posts/${post._id.toString()}`,
         push: {
-          enabled: post.notificationsEnabled !== false,
-          tokens: postAuthor?.expoPushTokens || [],
-          channelId: "messages",
+          eventType: "reply_comment",
+          title: `${req.user.name} replied to your comment`,
+          body: text,
+        },
+      });
+    } else {
+      await createNotification({
+        recipientId: post.author,
+        actor: req.user,
+        type: "comment_post",
+        postId: post._id,
+        referenceId: comment._id.toString(),
+        message: "commented on your post.",
+        deepLink: `/posts/${post._id.toString()}`,
+        push: {
+          eventType: "comment_post",
+          title: `${req.user.name} commented on your post`,
+          body: text,
         },
       });
     }
 
-    if (
-      repliedToUserId &&
-      repliedToUserId !== actorId &&
-      repliedToUserId !== authorId
-    ) {
-      try {
-        const repliedUser = await User.findById(repliedToUserId).select(
-          "expoPushTokens",
-        );
-        await createUserNotification({
-          userId: repliedToUserId,
-          type: "post_comment",
-          title: `${req.user?.name || "Someone"} replied to your comment`,
-          body: text.slice(0, 160) || "Someone replied to your comment.",
-          data: {
-            type: "post_comment",
-            postId: post._id.toString(),
-            commentId: newCommentId.toString(),
-            actorId,
-            actorName: req.user?.name || "",
-            isReply: true,
-          },
-          push: {
-            enabled: post.notificationsEnabled !== false,
-            tokens: repliedUser?.expoPushTokens || [],
-            channelId: "messages",
-          },
-        });
-      } catch (notificationError) {
-        console.warn(
-          "[post_reply] notification dispatch failed:",
-          notificationError,
-        );
-      }
-    }
-
     return res.status(201).json({
-      comment,
-      commentsCount: serializedComments.length,
+      comment: mapComment(comment),
+      commentsCount: post.comments.length,
     });
   } catch (error) {
     return next(error);
   }
 };
 
-const toggleCommentLike = async (req, res, next) => {
+const deleteComment = async (req, res, next) => {
   try {
     const { postId, commentId } = req.params;
-    const userId = req.user._id.toString();
-    const friendIdSet = buildFriendIdSet(req.user);
-    const blockedIdSet = buildBlockedIdSet(req.user);
     const post = await Post.findById(postId);
 
     if (!post) {
       throw createHttpError(404, "Post not found");
-    }
-
-    if (!canViewerSeePost(post, userId, friendIdSet)) {
-      throw createHttpError(403, "You cannot interact with this post");
-    }
-    if (isBlockedAuthor(post, blockedIdSet)) {
-      throw createHttpError(403, "Action not allowed");
     }
 
     const comment = post.comments.id(commentId);
@@ -463,138 +385,43 @@ const toggleCommentLike = async (req, res, next) => {
       throw createHttpError(404, "Comment not found");
     }
 
-    const existingIndex = comment.likes.findIndex(
-      (id) => id.toString() === userId,
+    if (comment.author.toString() !== req.user._id.toString()) {
+      throw createHttpError(403, "You can only delete your own comments");
+    }
+
+    const idsToDelete = new Set([commentId]);
+    let changed = true;
+
+    while (changed) {
+      changed = false;
+
+      for (const currentComment of post.comments) {
+        const parentId = currentComment.parentComment
+          ? currentComment.parentComment.toString()
+          : null;
+        const currentId = currentComment._id.toString();
+
+        if (parentId && idsToDelete.has(parentId) && !idsToDelete.has(currentId)) {
+          idsToDelete.add(currentId);
+          changed = true;
+        }
+      }
+    }
+
+    post.comments = post.comments.filter(
+      (currentComment) => !idsToDelete.has(currentComment._id.toString()),
     );
-    const liked = existingIndex === -1;
-
-    if (liked) {
-      comment.likes.push(new mongoose.Types.ObjectId(userId));
-    } else {
-      comment.likes.splice(existingIndex, 1);
-    }
-
+    post.markModified("comments");
     await post.save();
-
-    return res.status(200).json({
-      liked,
-      likeCount: comment.likes.length,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const togglePostNotifications = async (req, res, next) => {
-  try {
-    const { postId } = req.params;
-    const post = await Post.findById(postId);
-
-    if (!post) {
-      throw createHttpError(404, "Post not found");
-    }
-
-    if (post.author.toString() !== req.user._id.toString()) {
-      throw createHttpError(403, "You can update only your own posts");
-    }
-
-    post.notificationsEnabled = !post.notificationsEnabled;
-    await post.save();
-
-    return res.status(200).json({
-      notificationsEnabled: post.notificationsEnabled,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const reportPost = async (req, res, next) => {
-  try {
-    const { postId } = req.params;
-    const userId = req.user._id.toString();
-    const friendIdSet = buildFriendIdSet(req.user);
-    const blockedIdSet = buildBlockedIdSet(req.user);
-    const reason = typeof req.body.reason === "string" ? req.body.reason : "";
-    const description =
-      typeof req.body.description === "string" ? req.body.description.trim() : "";
-
-    const post = await Post.findById(postId).select("_id author");
-    if (!post) {
-      throw createHttpError(404, "Post not found");
-    }
-
-    if (!canViewerSeePost(post, userId, friendIdSet)) {
-      throw createHttpError(403, "You cannot report this post");
-    }
-    if (isBlockedAuthor(post, blockedIdSet)) {
-      throw createHttpError(403, "Action not allowed");
-    }
-
-    await Report.create({
+    await deleteNotifications({
       post: post._id,
-      reporter: req.user._id,
-      reason,
-      description,
-      status: "open",
+      referenceId: { $in: [...idsToDelete] },
+      type: { $in: ["comment_post", "reply_comment"] },
     });
 
-    return res.status(201).json({ message: "Report submitted" });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const sharePost = async (req, res, next) => {
-  try {
-    const { postId } = req.params;
-    const userId = req.user._id.toString();
-    const friendIdSet = buildFriendIdSet(req.user);
-    const blockedIdSet = buildBlockedIdSet(req.user);
-    const text = typeof req.body.text === "string" ? req.body.text.trim() : "";
-    const visibility = normalizePostVisibility(req.body.visibility);
-
-    const originalPost = await Post.findById(postId)
-      .populate("author", "name avatarUrl")
-      .lean();
-
-    if (!originalPost) {
-      throw createHttpError(404, "Post not found");
-    }
-
-    if (!canViewerSeePost(originalPost, userId, friendIdSet)) {
-      throw createHttpError(403, "You cannot share this post");
-    }
-    if (isBlockedAuthor(originalPost, blockedIdSet)) {
-      throw createHttpError(403, "Action not allowed");
-    }
-
-    const shared = await Post.create({
-      author: req.user._id,
-      text,
-      imageUrl: "",
-      imageUrls: [],
-      visibility,
-      sharedPost: originalPost._id,
-      likes: [],
-      comments: [],
-      notificationsEnabled: true,
-    });
-
-    const createdPost = await Post.findById(shared._id)
-      .populate("author", "name avatarUrl")
-      .populate({
-        path: "sharedPost",
-        populate: {
-          path: "author",
-          select: "name avatarUrl",
-        },
-      })
-      .populate("comments.author", "name avatarUrl")
-      .lean();
-
-    return res.status(201).json({
-      post: serializePost(createdPost, req.user._id.toString()),
+    return res.status(200).json({
+      message: "Comment deleted",
+      commentsCount: post.comments.length,
     });
   } catch (error) {
     return next(error);
@@ -614,6 +441,7 @@ const deletePost = async (req, res, next) => {
       throw createHttpError(403, "You can delete only your own posts");
     }
 
+    await deleteNotifications({ post: post._id });
     await Post.deleteOne({ _id: postId });
     return res.status(200).json({ message: "Post deleted" });
   } catch (error) {
@@ -673,6 +501,9 @@ const seedPosts = async (_req, res, next) => {
         text: 'Christopher Nolan\'s "The Dark Knight" inspired Timothee Chalamet to become an actor. A masterpiece that changed cinema forever. 🎬✨',
         imageUrl:
           "https://public.youware.com/users-website-assets/prod/a75881b7-308c-4271-80ce-76a6227bc546/f5d02131c15447ea9320de112b4b1f67.jpg",
+        imageUrls: [
+          "https://public.youware.com/users-website-assets/prod/a75881b7-308c-4271-80ce-76a6227bc546/f5d02131c15447ea9320de112b4b1f67.jpg",
+        ],
         likes: [seedUsers[1]._id, seedUsers[2]._id, seedUsers[3]._id],
         comments: [
           { author: seedUsers[1]._id, text: "Absolutely iconic film!" },
@@ -684,13 +515,17 @@ const seedPosts = async (_req, res, next) => {
         text: "Silence speaks when words can't. The winter solitude is magical. ❄️🏔️",
         imageUrl:
           "https://public.youware.com/users-website-assets/prod/a75881b7-308c-4271-80ce-76a6227bc546/5fb5f9df61ed4df3a886fd97ecd87794.jpg",
+        imageUrls: [
+          "https://public.youware.com/users-website-assets/prod/a75881b7-308c-4271-80ce-76a6227bc546/5fb5f9df61ed4df3a886fd97ecd87794.jpg",
+        ],
         likes: [seedUsers[0]._id, seedUsers[3]._id],
         comments: [{ author: seedUsers[3]._id, text: "This is breathtaking!" }],
       },
       {
         author: seedUsers[2]._id,
         text: "Just finished my first marathon! 🏃‍♀️ So proud of this achievement! Never give up on your dreams 💪",
-        imageUrl: "https://picsum.photos/800/500?random=7",
+        imageUrl: "",
+        imageUrls: [],
         likes: [seedUsers[0]._id, seedUsers[1]._id, seedUsers[3]._id],
         comments: [
           { author: seedUsers[0]._id, text: "Congratulations!! 🎉" },
@@ -702,6 +537,7 @@ const seedPosts = async (_req, res, next) => {
         author: seedUsers[3]._id,
         text: "New workspace, new energy! 🖥️✨ Working from home has never felt this good.",
         imageUrl: "https://picsum.photos/800/500?random=6",
+        imageUrls: ["https://picsum.photos/800/500?random=6"],
         likes: [seedUsers[2]._id],
         comments: [{ author: seedUsers[2]._id, text: "Love the setup!" }],
       },
@@ -718,14 +554,11 @@ const seedPosts = async (_req, res, next) => {
 module.exports = {
   listPosts,
   getPost,
+  getComments,
   createPost,
-  updatePost,
   toggleLike,
   addComment,
-  toggleCommentLike,
-  reportPost,
-  sharePost,
-  togglePostNotifications,
+  deleteComment,
   deletePost,
   seedPosts,
 };

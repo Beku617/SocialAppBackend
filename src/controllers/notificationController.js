@@ -1,41 +1,75 @@
 const Notification = require("../models/Notification");
 const { createHttpError } = require("../utils/httpError");
-const { sendExpoPushNotifications } = require("../utils/pushNotifications");
+const { toIdString } = require("../utils/notifications");
 
-const ACTIVITY_NOTIFICATION_TYPES = [
-  "post_like",
-  "post_comment",
-  "reel_like",
-  "reel_comment",
-  "reel_upload_complete",
-  "admin_broadcast",
-  "friend_request",
-  "friend_request_accepted",
-];
+const mapNotification = (notification) => {
+  const actorId = notification.actor ? toIdString(notification.actor) : "";
 
-const serializeNotification = (notification) => ({
-  id: notification._id.toString(),
-  type: notification.type,
-  title: notification.title,
-  body: notification.body,
-  data: notification.data || {},
-  read: Boolean(notification.read),
-  createdAt: notification.createdAt,
-});
+  return {
+    id: notification._id.toString(),
+    type: notification.type,
+    title: notification.title || "",
+    message: notification.message,
+    category: notification.category || "activity",
+    isRead: Boolean(notification.isRead),
+    createdAt: notification.createdAt,
+    actor: {
+      id: actorId,
+      name: notification.actor?.name || notification.actorName || "Unknown user",
+      avatarUrl: notification.actor?.avatarUrl || notification.actorAvatarUrl || "",
+    },
+    target: {
+      userId:
+        notification.type === "chat_message" ||
+        notification.type === "follow" ||
+        notification.type === "friend_request" ||
+        notification.type === "friend_accept"
+          ? actorId
+          : null,
+      postId: notification.post ? notification.post.toString() : null,
+      reelId: notification.reel ? notification.reel.toString() : null,
+      referenceId: notification.referenceId || null,
+      deepLink: notification.deepLink || null,
+    },
+  };
+};
 
 const listNotifications = async (req, res, next) => {
   try {
-    const notifications = await Notification.find({
-      user: req.user._id,
-      type: { $in: ACTIVITY_NOTIFICATION_TYPES },
-    })
-      .sort({ createdAt: -1 })
-      .limit(200)
-      .lean();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const skip = (page - 1) * limit;
+
+    const [notifications, totalCount, unreadCount] = await Promise.all([
+      Notification.find({ recipient: req.user._id })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate("actor", "name avatarUrl")
+        .lean(),
+      Notification.countDocuments({ recipient: req.user._id }),
+      Notification.countDocuments({ recipient: req.user._id, isRead: false }),
+    ]);
 
     return res.status(200).json({
-      notifications: notifications.map(serializeNotification),
+      notifications: notifications.map(mapNotification),
+      unreadCount,
+      page,
+      hasMore: skip + notifications.length < totalCount,
     });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getUnreadNotificationsCount = async (req, res, next) => {
+  try {
+    const unreadCount = await Notification.countDocuments({
+      recipient: req.user._id,
+      isRead: false,
+    });
+
+    return res.status(200).json({ unreadCount });
   } catch (error) {
     return next(error);
   }
@@ -43,21 +77,30 @@ const listNotifications = async (req, res, next) => {
 
 const markNotificationRead = async (req, res, next) => {
   try {
-    const { notificationId } = req.params;
-    const notification = await Notification.findOneAndUpdate(
-      {
-        _id: notificationId,
-        user: req.user._id,
-      },
-      { $set: { read: true } },
-      { new: true },
-    ).lean();
+    const notification = await Notification.findOne({
+      _id: req.params.id,
+      recipient: req.user._id,
+    });
 
     if (!notification) {
       throw createHttpError(404, "Notification not found");
     }
 
-    return res.status(200).json({ notification: serializeNotification(notification) });
+    if (!notification.isRead) {
+      notification.isRead = true;
+      notification.readAt = new Date();
+      await notification.save();
+    }
+
+    const unreadCount = await Notification.countDocuments({
+      recipient: req.user._id,
+      isRead: false,
+    });
+
+    return res.status(200).json({
+      notification: mapNotification(notification),
+      unreadCount,
+    });
   } catch (error) {
     return next(error);
   }
@@ -66,37 +109,13 @@ const markNotificationRead = async (req, res, next) => {
 const markAllNotificationsRead = async (req, res, next) => {
   try {
     await Notification.updateMany(
-      {
-        user: req.user._id,
-        read: false,
-        type: { $in: ACTIVITY_NOTIFICATION_TYPES },
-      },
-      { $set: { read: true } },
+      { recipient: req.user._id, isRead: false },
+      { $set: { isRead: true, readAt: new Date() } },
     );
-    return res.status(200).json({ ok: true });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const sendTestPush = async (req, res, next) => {
-  try {
-    const tokens = Array.isArray(req.user.expoPushTokens)
-      ? req.user.expoPushTokens
-      : [];
-
-    const pushResult = await sendExpoPushNotifications({
-      tokens,
-      title: "Connect test",
-      body: "Push test from server",
-      data: { type: "push_test" },
-      channelId: "messages",
-    });
 
     return res.status(200).json({
-      ok: true,
-      tokens: tokens.length,
-      push: pushResult,
+      message: "Notifications marked as read",
+      unreadCount: 0,
     });
   } catch (error) {
     return next(error);
@@ -104,8 +123,8 @@ const sendTestPush = async (req, res, next) => {
 };
 
 module.exports = {
+  getUnreadNotificationsCount,
   listNotifications,
   markNotificationRead,
   markAllNotificationsRead,
-  sendTestPush,
 };

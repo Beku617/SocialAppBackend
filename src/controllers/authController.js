@@ -1,167 +1,133 @@
 const bcrypt = require("bcryptjs");
-const Notification = require("../models/Notification");
-const Reel = require("../models/Reel");
+const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const { createHttpError } = require("../utils/httpError");
-const { generateToken } = require("../utils/generateToken");
-const { serializePost } = require("../utils/serializePost");
-const { createUserNotification } = require("../utils/notificationCenter");
-const { buildBanSnapshot, ensureUserCanAccess } = require("../utils/userAccess");
-const { isExpoPushToken } = require("../utils/pushNotifications");
+const { env } = require("../config/env");
+const { generateAuthTokens } = require("../utils/generateToken");
+const FriendRequest = require("../models/FriendRequest");
+const {
+  deleteNotifications,
+  replaceNotification,
+} = require("../utils/notifications");
+const {
+  buildFriendshipStatusMap,
+  getFriendshipStatus,
+  mapUserPreview,
+  normalizeId,
+} = require("../utils/friendships");
+const { isAdminUser } = require("../utils/admin");
+const {
+  buildActiveAccountQuery,
+  getUserStatusErrorMessage,
+  isUserActive,
+} = require("../utils/userAccountStatus");
 
-const buildUsernameBase = (value) => {
-  const normalized = String(value || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9._]+/g, "")
-    .slice(0, 24);
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const MAX_RECENT_SEARCHES = 12;
 
-  return normalized || `user${Date.now().toString().slice(-6)}`;
+const mapUserPayload = (user) => {
+  const json = user.toJSON();
+  const isAdmin = isAdminUser(user);
+  json.role = user.role || (isAdmin ? "admin" : "user");
+  json.isAdmin = isAdmin;
+  json.accountStatus = user.accountStatus || "active";
+  json.lastLoginAt = user.lastLoginAt || null;
+  return json;
 };
 
-const normalizeUsername = (value) =>
-  String(value || "")
-    .trim()
-    .replace(/^@+/, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9._]+/g, "")
-    .slice(0, 30);
+const mapRecentSearch = (item) => {
+  const targetUser = item.targetUser;
+  const targetUserId =
+    targetUser && typeof targetUser === "object" && targetUser._id
+      ? targetUser._id.toString()
+      : item.targetUser
+        ? item.targetUser.toString()
+        : "";
 
-const escapeRegex = (value) =>
-  String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-const isUsernameFormatValid = (username) =>
-  /^[a-z0-9._]{3,30}$/.test(String(username || ""));
-
-const createUniqueUsername = async (name, email) => {
-  const base = buildUsernameBase(email.split("@")[0] || name);
-  let candidate = base;
-  let suffix = 1;
-
-  while (await User.exists({ username: candidate })) {
-    candidate = `${base}${suffix}`.slice(0, 30);
-    suffix += 1;
-  }
-
-  return candidate;
+  return {
+    id: item._id.toString(),
+    kind: item.kind,
+    query: item.query || "",
+    createdAt: item.createdAt,
+    user:
+      item.kind === "user" && (targetUserId || item.targetUserName)
+        ? {
+            id: targetUserId,
+            name: targetUser?.name || item.targetUserName || "Unknown user",
+            avatarUrl: targetUser?.avatarUrl || item.targetUserAvatarUrl || "",
+            bio: targetUser?.bio || "",
+          }
+        : null,
+  };
 };
 
-const buildAuthUserPayload = (user) => ({
-  ...user.toJSON(),
-  ban: buildBanSnapshot(user),
-});
+const hashRefreshToken = (token) =>
+  crypto.createHash("sha256").update(token).digest("hex");
 
-const toIdString = (value) => {
-  if (!value) return "";
-  if (typeof value === "string") return value;
-  if (value._id) return value._id.toString();
-  return value.toString();
-};
+const buildAuthPayload = (user) => {
+  const userId = user._id.toString();
+  const tokens = generateAuthTokens(userId);
 
-const hasUserId = (values, userId) =>
-  Array.isArray(values) &&
-  values.some((value) => toIdString(value) === String(userId));
-
-const addUniqueUserId = (values, userId) => {
-  const normalizedUserId = String(userId);
-  if (!hasUserId(values, normalizedUserId)) {
-    values.push(normalizedUserId);
-  }
-};
-
-const removeUserId = (values, userId) =>
-  Array.isArray(values)
-    ? values.filter((value) => toIdString(value) !== String(userId))
-    : [];
-
-const buildBlockedIdSet = (user) =>
-  new Set(
-    Array.isArray(user?.blockedUsers) ? user.blockedUsers.map(toIdString) : [],
-  );
-
-const isBlockedRelation = (leftUser, rightUserId) =>
-  hasUserId(leftUser?.blockedUsers, rightUserId);
-
-const normalizeVisibility = (value) => {
-  if (value === "followers") return "friends";
-  if (value === "friends" || value === "private") return value;
-  return "public";
-};
-
-const canViewerSeeContent = (visibility, authorId, viewerId, viewerFriendSet) => {
-  if (authorId === viewerId) return true;
-  if (visibility === "public") return true;
-  if (visibility === "friends") return viewerFriendSet.has(authorId);
-  return false;
+  return {
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+    accessTokenExpiresAt: tokens.accessTokenExpiresAt.toISOString(),
+    refreshTokenExpiresAt: tokens.refreshTokenExpiresAt.toISOString(),
+    user: mapUserPayload(user),
+    refreshTokenHash: hashRefreshToken(tokens.refreshToken),
+    refreshTokenExpiry: tokens.refreshTokenExpiresAt,
+  };
 };
 
 const register = async (req, res, next) => {
   try {
-    const { email, password } = req.body;
-    const requestedUsername = normalizeUsername(req.body?.username);
-    const normalizedEmail = String(email || "").toLowerCase();
-    if (!requestedUsername || !isUsernameFormatValid(requestedUsername)) {
-      throw createHttpError(
-        400,
-        "Username must be 3-30 chars and use letters, numbers, dot, or underscore",
-      );
+    const username =
+      typeof req.body.username === "string"
+        ? req.body.username.trim().toLowerCase()
+        : "";
+    const email =
+      typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+
+    if (!username || !email || !password) {
+      throw createHttpError(400, "All required fields must be provided");
     }
 
-    const existingUser = await User.findOne({ email: normalizedEmail });
+    const existingUser = await User.findOne({ email });
     if (existingUser) {
       throw createHttpError(409, "Email already in use");
     }
 
-    const passwordHash = await bcrypt.hash(password, 12);
-    const exists = await User.exists({ username: requestedUsername });
-    if (exists) {
+    const existingUsername = await User.findOne({ username });
+    if (existingUsername) {
       throw createHttpError(409, "Username already taken");
     }
-    const username = requestedUsername;
 
+    const passwordHash = await bcrypt.hash(password, 12);
+    const displayName =
+      typeof req.body.name === "string" && req.body.name.trim()
+        ? req.body.name.trim()
+        : username;
     const user = await User.create({
-      name: username,
-      email: normalizedEmail,
+      name: displayName,
       username,
+      email,
       passwordHash,
       role: "user",
     });
-    const token = generateToken(user._id.toString());
+
+    const authPayload = buildAuthPayload(user);
+    user.refreshTokenHash = authPayload.refreshTokenHash;
+    user.refreshTokenExpiresAt = authPayload.refreshTokenExpiry;
+    await user.save();
 
     return res.status(201).json({
-      token,
-      user: buildAuthUserPayload(user),
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const checkUsernameAvailability = async (req, res, next) => {
-  try {
-    const username = normalizeUsername(req.query?.username);
-
-    if (!username) {
-      return res.status(200).json({
-        available: false,
-        username: "",
-        message: "Username is required",
-      });
-    }
-
-    if (!isUsernameFormatValid(username)) {
-      return res.status(200).json({
-        available: false,
-        username,
-        message:
-          "Username must be 3-30 chars and use letters, numbers, dot, or underscore",
-      });
-    }
-
-    const exists = await User.exists({ username });
-    return res.status(200).json({
-      available: !exists,
-      username,
-      message: exists ? "Username already taken" : "Username available",
+      accessToken: authPayload.accessToken,
+      refreshToken: authPayload.refreshToken,
+      accessTokenExpiresAt: authPayload.accessTokenExpiresAt,
+      refreshTokenExpiresAt: authPayload.refreshTokenExpiresAt,
+      user: authPayload.user,
     });
   } catch (error) {
     return next(error);
@@ -170,27 +136,138 @@ const checkUsernameAvailability = async (req, res, next) => {
 
 const login = async (req, res, next) => {
   try {
-    const { email, password } = req.body;
-    const identifier = String(email || "").trim().toLowerCase();
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    const rawIdentifier =
+      typeof req.body.identifier === "string" && req.body.identifier.trim()
+        ? req.body.identifier.trim()
+        : typeof req.body.email === "string"
+          ? req.body.email.trim()
+          : "";
 
-    const user = await User.findOne({
-      $or: [{ email: identifier }, { username: identifier }],
-    });
+    if (!rawIdentifier || !password) {
+      throw createHttpError(400, "Username or email and password are required");
+    }
+
+    const normalizedIdentifier = rawIdentifier.toLowerCase();
+    const isEmail = normalizedIdentifier.includes("@");
+
+    const user = await User.findOne(
+      isEmail ? { email: normalizedIdentifier } : { username: normalizedIdentifier },
+    ).select("+refreshTokenHash +refreshTokenExpiresAt");
     if (!user) {
-      throw createHttpError(401, "Invalid email or password");
+      throw createHttpError(401, "Invalid username or password");
     }
 
     const passwordMatch = await bcrypt.compare(password, user.passwordHash);
     if (!passwordMatch) {
-      throw createHttpError(401, "Invalid email or password");
+      throw createHttpError(401, "Invalid username or password");
     }
 
-    await ensureUserCanAccess(user);
-    const token = generateToken(user._id.toString());
+    if (!isUserActive(user)) {
+      throw createHttpError(403, getUserStatusErrorMessage(user.accountStatus));
+    }
+
+    user.lastLoginAt = new Date();
+    const authPayload = buildAuthPayload(user);
+    user.refreshTokenHash = authPayload.refreshTokenHash;
+    user.refreshTokenExpiresAt = authPayload.refreshTokenExpiry;
+    await user.save();
+
     return res.status(200).json({
-      token,
-      user: buildAuthUserPayload(user),
+      accessToken: authPayload.accessToken,
+      refreshToken: authPayload.refreshToken,
+      accessTokenExpiresAt: authPayload.accessTokenExpiresAt,
+      refreshTokenExpiresAt: authPayload.refreshTokenExpiresAt,
+      user: authPayload.user,
     });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const refreshSession = async (req, res, next) => {
+  try {
+    const refreshToken =
+      typeof req.body.refreshToken === "string" ? req.body.refreshToken.trim() : "";
+
+    if (!refreshToken) {
+      throw createHttpError(401, "Invalid refresh token");
+    }
+
+    let payload;
+    try {
+      payload = jwt.verify(refreshToken, env.JWT_REFRESH_SECRET);
+    } catch (_error) {
+      throw createHttpError(401, "Invalid refresh token");
+    }
+
+    if (!payload || payload.type !== "refresh" || !payload.sub) {
+      throw createHttpError(401, "Invalid refresh token");
+    }
+
+    const user = await User.findById(payload.sub).select(
+      "+refreshTokenHash +refreshTokenExpiresAt",
+    );
+    if (!user) {
+      throw createHttpError(401, "Invalid refresh token");
+    }
+
+    if (!isUserActive(user)) {
+      throw createHttpError(403, getUserStatusErrorMessage(user.accountStatus));
+    }
+
+    if (
+      !user.refreshTokenHash ||
+      !user.refreshTokenExpiresAt ||
+      user.refreshTokenExpiresAt.getTime() <= Date.now()
+    ) {
+      throw createHttpError(401, "Session expired");
+    }
+
+    const incomingHash = hashRefreshToken(refreshToken);
+    if (incomingHash !== user.refreshTokenHash) {
+      throw createHttpError(401, "Invalid refresh token");
+    }
+
+    const authPayload = buildAuthPayload(user);
+    user.refreshTokenHash = authPayload.refreshTokenHash;
+    user.refreshTokenExpiresAt = authPayload.refreshTokenExpiry;
+    await user.save();
+
+    return res.status(200).json({
+      accessToken: authPayload.accessToken,
+      refreshToken: authPayload.refreshToken,
+      accessTokenExpiresAt: authPayload.accessTokenExpiresAt,
+      refreshTokenExpiresAt: authPayload.refreshTokenExpiresAt,
+      user: authPayload.user,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const logout = async (req, res, next) => {
+  try {
+    const refreshToken =
+      typeof req.body.refreshToken === "string" ? req.body.refreshToken.trim() : "";
+
+    if (refreshToken) {
+      try {
+        const payload = jwt.verify(refreshToken, env.JWT_REFRESH_SECRET);
+        if (payload?.sub) {
+          await User.findByIdAndUpdate(payload.sub, {
+            $set: {
+              refreshTokenHash: null,
+              refreshTokenExpiresAt: null,
+            },
+          });
+        }
+      } catch (_error) {
+        // Intentionally ignore invalid tokens to make logout idempotent.
+      }
+    }
+
+    return res.status(200).json({ message: "Logged out" });
   } catch (error) {
     return next(error);
   }
@@ -198,88 +275,11 @@ const login = async (req, res, next) => {
 
 const getMe = async (req, res) => {
   const user = req.user;
-  const json = buildAuthUserPayload(user);
+  const json = mapUserPayload(user);
+  json.friendsCount = user.friends ? user.friends.length : 0;
   json.followersCount = user.followers ? user.followers.length : 0;
   json.followingCount = user.following ? user.following.length : 0;
-  json.friendsCount = user.friends ? user.friends.length : 0;
   return res.status(200).json({ user: json });
-};
-
-const savePushToken = async (req, res, next) => {
-  try {
-    const token = String(req.body?.token || req.body?.pushToken || "").trim();
-    const userId = req.user?._id?.toString?.() || "(missing-user-id)";
-    console.log("[push] savePushToken received raw token:", token);
-    console.log("[push] savePushToken received userId:", userId);
-    console.log(
-      "[push] savePushToken existing req.user.expoPushTokens:",
-      req.user?.expoPushTokens || [],
-    );
-
-    if (!isExpoPushToken(token)) {
-      console.warn(
-        "[push] savePushToken rejected token format; expected prefix ExponentPushToken[",
-      );
-      throw createHttpError(400, "Invalid push token");
-    }
-
-    // Keep one physical device token mapped to only one account.
-    await User.updateMany(
-      { _id: { $ne: req.user._id }, expoPushTokens: token },
-      { $pull: { expoPushTokens: token } },
-    );
-
-    await User.updateOne(
-      { _id: req.user._id },
-      { $addToSet: { expoPushTokens: token } },
-    );
-
-    const refreshedUser = await User.findById(req.user._id)
-      .select("expoPushTokens")
-      .lean();
-    console.log(
-      "[push] saved token",
-      token,
-      "for",
-      userId,
-      "current expoPushTokens:",
-      refreshedUser?.expoPushTokens || [],
-    );
-    return res.status(200).json({ ok: true });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const removePushToken = async (req, res, next) => {
-  try {
-    const token = String(req.body?.token || req.body?.pushToken || "").trim();
-    if (!isExpoPushToken(token)) {
-      throw createHttpError(400, "Invalid push token");
-    }
-
-    await User.updateMany({ expoPushTokens: token }, { $pull: { expoPushTokens: token } });
-    return res.status(200).json({ ok: true });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const getMyPushTokensDebug = async (req, res, next) => {
-  try {
-    const userId = req.user?._id?.toString?.() || "(missing-user-id)";
-    const expoPushTokens = Array.isArray(req.user?.expoPushTokens)
-      ? req.user.expoPushTokens
-      : [];
-    console.log("[push] debug my-tokens requested by userId:", userId);
-    console.log("[push] debug my-tokens value:", expoPushTokens);
-    return res.status(200).json({
-      userId,
-      expoPushTokens,
-    });
-  } catch (error) {
-    return next(error);
-  }
 };
 
 const updateProfile = async (req, res, next) => {
@@ -292,7 +292,7 @@ const updateProfile = async (req, res, next) => {
     if (avatarUrl !== undefined) user.avatarUrl = avatarUrl;
 
     await user.save();
-    return res.status(200).json({ user: user.toJSON() });
+    return res.status(200).json({ user: mapUserPayload(user) });
   } catch (error) {
     return next(error);
   }
@@ -318,7 +318,36 @@ const changePassword = async (req, res, next) => {
 
 const deleteAccount = async (req, res, next) => {
   try {
-    throw createHttpError(403, "Deleting your account is not allowed");
+    const Post = require("../models/Post");
+    const PushToken = require("../models/PushToken");
+    // Remove user's posts
+    await Post.deleteMany({ author: req.user._id });
+    await FriendRequest.deleteMany({
+      $or: [{ requester: req.user._id }, { recipient: req.user._id }],
+    });
+    await User.updateMany(
+      {
+        $or: [
+          { followers: req.user._id },
+          { following: req.user._id },
+          { friends: req.user._id },
+        ],
+      },
+      {
+        $pull: {
+          followers: req.user._id,
+          following: req.user._id,
+          friends: req.user._id,
+        },
+      },
+    );
+    await deleteNotifications({
+      $or: [{ recipient: req.user._id }, { actor: req.user._id }],
+    });
+    await PushToken.deleteMany({ user: req.user._id });
+    // Remove the user
+    await User.deleteOne({ _id: req.user._id });
+    return res.status(200).json({ message: "Account deleted" });
   } catch (error) {
     return next(error);
   }
@@ -326,41 +355,45 @@ const deleteAccount = async (req, res, next) => {
 
 const searchUsers = async (req, res, next) => {
   try {
-    const rawQuery = String(req.query?.q || "").trim();
-    const normalizedQuery = normalizeUsername(rawQuery) || rawQuery.toLowerCase();
-    if (!normalizedQuery || normalizedQuery.length < 1) {
+    const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    const mode = req.query.mode === "mention" ? "mention" : "default";
+
+    if (!query && mode !== "mention") {
       return res.status(200).json({ users: [] });
     }
 
-    const currentUserId = req.user._id.toString();
-    const blockedByCurrent = Array.isArray(req.user.blockedUsers)
-      ? req.user.blockedUsers.map((id) => id.toString())
-      : [];
-    const excludedIds = [currentUserId, ...blockedByCurrent];
-    const regex = new RegExp(escapeRegex(normalizedQuery), "i");
-    const users = await User.find({
-      _id: { $nin: excludedIds },
-      blockedUsers: { $ne: req.user._id },
-      $or: [{ name: regex }, { email: regex }, { username: regex }],
-    })
-      .select("name username avatarUrl bio")
+    const filters = [];
+
+    if (mode === "mention") {
+      if (query) {
+        filters.push({ name: new RegExp(`^${escapeRegex(query)}`, "i") });
+      }
+      filters.push({ _id: { $ne: req.user._id } });
+    } else {
+      const regex = new RegExp(escapeRegex(query), "i");
+      filters.push({
+        $or: [{ name: regex }, { email: regex }],
+      });
+      filters.push({ _id: { $ne: req.user._id } });
+    }
+
+    filters.push(buildActiveAccountQuery());
+    filters.push({ role: "user" });
+
+    const users = await User.find(filters.length > 1 ? { $and: filters } : filters[0] || {})
+      .select("name avatarUrl bio")
+      .sort({ name: 1 })
       .limit(20)
       .lean();
 
-    const mapped = users.map((u) => ({
-      id: u._id.toString(),
-      name: u.name,
-      username: u.username || "",
-      avatarUrl: u.avatarUrl || "",
-      bio: u.bio || "",
-    }));
+    const friendshipStatusMap = await buildFriendshipStatusMap(
+      req.user,
+      users.map((user) => user._id),
+    );
 
-    const result = mapped.sort((left, right) => {
-      const leftExact = left.username?.toLowerCase() === normalizedQuery ? 1 : 0;
-      const rightExact =
-        right.username?.toLowerCase() === normalizedQuery ? 1 : 0;
-      return rightExact - leftExact;
-    });
+    const result = users.map((u) =>
+      mapUserPreview(u, friendshipStatusMap[normalizeId(u._id)]),
+    );
 
     return res.status(200).json({ users: result });
   } catch (error) {
@@ -368,166 +401,158 @@ const searchUsers = async (req, res, next) => {
   }
 };
 
+const getRecentSearches = async (req, res, next) => {
+  try {
+    await req.user.populate("recentSearches.targetUser", "name avatarUrl bio");
+
+    const items = [...(req.user.recentSearches || [])]
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .map(mapRecentSearch);
+
+    return res.status(200).json({ items });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const saveRecentSearch = async (req, res, next) => {
+  try {
+    const kind = req.body.kind === "user" ? "user" : "query";
+    const currentUser = req.user;
+    const currentSearches = Array.isArray(currentUser.recentSearches)
+      ? [...currentUser.recentSearches]
+      : [];
+
+    if (kind === "query") {
+      const query = typeof req.body.query === "string" ? req.body.query.trim() : "";
+      if (!query) {
+        throw createHttpError(400, "Query is required");
+      }
+
+      currentUser.recentSearches = [
+        {
+          kind: "query",
+          query,
+          createdAt: new Date(),
+        },
+        ...currentSearches.filter(
+          (item) =>
+            !(
+              item.kind === "query" &&
+              item.query &&
+              item.query.toLowerCase() === query.toLowerCase()
+            ),
+        ),
+      ].slice(0, MAX_RECENT_SEARCHES);
+    } else {
+      const targetUserId =
+        typeof req.body.userId === "string" ? req.body.userId.trim() : "";
+      if (!targetUserId) {
+        throw createHttpError(400, "User is required");
+      }
+
+      const targetUser = await User.findById(targetUserId).select("name avatarUrl");
+      if (!targetUser) {
+        throw createHttpError(404, "User not found");
+      }
+
+      currentUser.recentSearches = [
+        {
+          kind: "user",
+          targetUser: targetUser._id,
+          targetUserName: targetUser.name,
+          targetUserAvatarUrl: targetUser.avatarUrl || "",
+          createdAt: new Date(),
+        },
+        ...currentSearches.filter(
+          (item) =>
+            !(
+              item.kind === "user" &&
+              item.targetUser &&
+              item.targetUser.toString() === targetUser._id.toString()
+            ),
+        ),
+      ].slice(0, MAX_RECENT_SEARCHES);
+    }
+
+    await currentUser.save();
+    await currentUser.populate("recentSearches.targetUser", "name avatarUrl bio");
+
+    const savedItem = currentUser.recentSearches[0];
+    return res.status(201).json({
+      item: savedItem ? mapRecentSearch(savedItem) : null,
+      items: currentUser.recentSearches.map(mapRecentSearch),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const deleteRecentSearch = async (req, res, next) => {
+  try {
+    const recentSearchId = req.params.searchId;
+    req.user.recentSearches = (req.user.recentSearches || []).filter(
+      (item) => item._id.toString() !== recentSearchId,
+    );
+    await req.user.save();
+
+    return res.status(200).json({ message: "Recent search removed" });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const clearRecentSearches = async (req, res, next) => {
+  try {
+    req.user.recentSearches = [];
+    await req.user.save();
+
+    return res.status(200).json({ message: "Recent searches cleared" });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const getUserProfile = async (req, res, next) => {
   try {
-    const viewerId = req.user._id.toString();
     const user = await User.findById(req.params.userId);
     if (!user) {
       throw createHttpError(404, "User not found");
     }
-
-    if (
-      isBlockedRelation(req.user, user._id.toString()) ||
-      isBlockedRelation(user, viewerId)
-    ) {
+    if (!isUserActive(user)) {
+      throw createHttpError(404, "User not found");
+    }
+    if (isAdminUser(user)) {
       throw createHttpError(404, "User not found");
     }
 
     const Post = require("../models/Post");
-    const viewerFriendSet = new Set(
-      Array.isArray(req.user.friends) ? req.user.friends.map(toIdString) : [],
-    );
-    const isOwnProfile = viewerId === user._id.toString();
-
-    const [allPosts, allReels] = await Promise.all([
-      Post.find({ author: user._id })
-        .sort({ createdAt: -1 })
-        .populate("author", "name avatarUrl")
-        .populate({
-          path: "sharedPost",
-          populate: {
-            path: "author",
-            select: "name avatarUrl",
-          },
-        })
-        .populate("comments.author", "name avatarUrl")
-        .lean(),
-      Reel.find({
-        author: user._id,
-        ...(isOwnProfile ? {} : { status: "ready" }),
-      })
-        .sort({ createdAt: -1 })
-        .populate("author", "name avatarUrl")
-        .lean(),
-    ]);
-
-    const posts = allPosts
-      .filter((post) =>
-        canViewerSeeContent(
-          normalizeVisibility(post.visibility),
-          user._id.toString(),
-          viewerId,
-          viewerFriendSet,
-        ),
-      )
-      .map((post) => {
-        if (
-          post.sharedPost &&
-          !canViewerSeeContent(
-            normalizeVisibility(post.sharedPost.visibility),
-            toIdString(post.sharedPost.author),
-            viewerId,
-            viewerFriendSet,
-          )
-        ) {
-          post.sharedPost = null;
-        }
-        return serializePost(post, viewerId);
-      });
-
-    const reels = allReels
-      .filter((reel) =>
-        canViewerSeeContent(
-          normalizeVisibility(reel.visibility),
-          toIdString(reel.author),
-          viewerId,
-          viewerFriendSet,
-        ),
-      )
-      .map((reel) => {
-        const normalizedVisibility = normalizeVisibility(reel.visibility);
-        return {
-          id: reel._id.toString(),
-          author: {
-            id: toIdString(reel.author),
-            name: reel.author?.name || "Unknown",
-            avatarUrl: reel.author?.avatarUrl || "",
-          },
-          caption: reel.caption || "",
-          music: reel.music || "",
-          storageKey: reel.storageKey || "",
-          originalUrl: reel.originalUrl || "",
-          playbackUrl: reel.playbackUrl || "",
-          thumbUrl: reel.thumbUrl || "",
-          duration: reel.duration || 0,
-          width: reel.width || 0,
-          height: reel.height || 0,
-          visibility: normalizedVisibility,
-          status: reel.status || "ready",
-          failureReason: reel.failureReason || "",
-          likesCount: Number.isFinite(reel.likesCount)
-            ? reel.likesCount
-            : Array.isArray(reel.likes)
-              ? reel.likes.length
-              : 0,
-          commentsCount: Number.isFinite(reel.commentsCount)
-            ? reel.commentsCount
-            : 0,
-          viewsCount: Number.isFinite(reel.viewsCount)
-            ? reel.viewsCount
-            : Array.isArray(reel.viewers)
-              ? reel.viewers.length
-              : 0,
-          repostsCount: Number.isFinite(reel.repostsCount)
-            ? reel.repostsCount
-            : 0,
-          sharesCount: Number.isFinite(reel.sharesCount)
-            ? reel.sharesCount
-            : 0,
-          savesCount: Number.isFinite(reel.savesCount)
-            ? reel.savesCount
-            : Array.isArray(reel.saves)
-              ? reel.saves.length
-              : 0,
-          likedByMe: hasUserId(reel.likes, viewerId),
-          savedByMe: hasUserId(reel.saves, viewerId),
-          ownedByMe: toIdString(reel.author) === viewerId,
-          createdAt: reel.createdAt,
-          updatedAt: reel.updatedAt,
-          processedAt: reel.processedAt || null,
-        };
-      });
+    const posts = await Post.find({ author: user._id })
+      .sort({ createdAt: -1 })
+      .populate("author", "name avatarUrl")
+      .populate("comments.author", "name avatarUrl")
+      .populate("comments.mentions.user", "name avatarUrl");
 
     const postCount = posts.length;
+    const friendsCount = user.friends ? user.friends.length : 0;
     const followersCount = user.followers ? user.followers.length : 0;
     const followingCount = user.following ? user.following.length : 0;
-    const friendsCount = user.friends ? user.friends.length : 0;
     const isFollowing = user.followers
       ? user.followers.some((id) => id.toString() === req.user._id.toString())
       : false;
-    const isFriend = hasUserId(user.friends, viewerId);
-    const friendRequestPending = hasUserId(user.friendRequestsReceived, viewerId);
-    const friendRequestIncoming = hasUserId(
-      req.user.friendRequestsReceived,
-      user._id.toString(),
-    );
+    const friendshipStatus = await getFriendshipStatus(req.user, user._id);
 
     const json = user.toJSON();
+    json.friendsCount = friendsCount;
     json.followersCount = followersCount;
     json.followingCount = followingCount;
-    json.friendsCount = friendsCount;
-    json.ban = buildBanSnapshot(user);
 
     return res.status(200).json({
       user: json,
       posts,
-      reels,
       postCount,
       isFollowing,
-      isFriend,
-      isOwnProfile,
-      friendRequestPending,
-      friendRequestIncoming,
+      friendshipStatus,
     });
   } catch (error) {
     return next(error);
@@ -547,12 +572,11 @@ const toggleFollow = async (req, res, next) => {
     if (!targetUser) {
       throw createHttpError(404, "User not found");
     }
-
-    if (
-      isBlockedRelation(req.user, targetUserId) ||
-      isBlockedRelation(targetUser, currentUserId.toString())
-    ) {
-      throw createHttpError(403, "Action not allowed");
+    if (!isUserActive(targetUser)) {
+      throw createHttpError(404, "User not found");
+    }
+    if (isAdminUser(targetUser)) {
+      throw createHttpError(404, "User not found");
     }
 
     const currentUser = await User.findById(currentUserId);
@@ -576,350 +600,30 @@ const toggleFollow = async (req, res, next) => {
 
     await Promise.all([targetUser.save(), currentUser.save()]);
 
+    if (!isFollowing) {
+      await replaceNotification({
+        filter: {
+          recipient: targetUser._id,
+          actor: currentUser._id,
+          type: "follow",
+        },
+        recipientId: targetUser._id,
+        actor: currentUser,
+        type: "follow",
+        message: "started following you.",
+        referenceId: currentUser._id.toString(),
+      });
+    } else {
+      await deleteNotifications({
+        recipient: targetUser._id,
+        actor: currentUser._id,
+        type: "follow",
+      });
+    }
+
     return res.status(200).json({
       isFollowing: !isFollowing,
       followersCount: targetUser.followers.length,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const sendFriendRequest = async (req, res, next) => {
-  try {
-    const requesterId = req.user._id.toString();
-    const recipientId = req.params.userId;
-
-    if (requesterId === recipientId) {
-      throw createHttpError(400, "Cannot add yourself");
-    }
-
-    const [requester, recipient] = await Promise.all([
-      User.findById(requesterId),
-      User.findById(recipientId),
-    ]);
-
-    if (!requester || !recipient) {
-      throw createHttpError(404, "User not found");
-    }
-
-    if (
-      isBlockedRelation(requester, recipientId) ||
-      isBlockedRelation(recipient, requesterId)
-    ) {
-      throw createHttpError(403, "Action not allowed");
-    }
-
-    if (hasUserId(requester.friends, recipientId)) {
-      return res.status(200).json({ status: "friends" });
-    }
-
-    if (hasUserId(recipient.friendRequestsReceived, requesterId)) {
-      return res.status(200).json({ status: "pending" });
-    }
-
-    addUniqueUserId(recipient.friendRequestsReceived, requesterId);
-    addUniqueUserId(requester.friendRequestsSent, recipientId);
-
-    addUniqueUserId(recipient.followers, requesterId);
-    addUniqueUserId(requester.following, recipientId);
-
-    await Promise.all([requester.save(), recipient.save()]);
-
-    await createUserNotification({
-      userId: recipient._id,
-      type: "friend_request",
-      title: `${requester.name || "Someone"} sent you a friend request`,
-      body: "Accept to become friends.",
-      data: {
-        type: "friend_request",
-        fromUserId: requesterId,
-        fromUserName: requester.name || "",
-        status: "pending",
-      },
-      push: {
-        enabled: true,
-        tokens: recipient.expoPushTokens || [],
-        channelId: "messages",
-      },
-    });
-
-    return res.status(200).json({
-      status: "pending",
-      followersCount: recipient.followers.length,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const acceptFriendRequest = async (req, res, next) => {
-  try {
-    const recipientId = req.user._id.toString();
-    const requesterId = req.params.userId;
-
-    if (recipientId === requesterId) {
-      throw createHttpError(400, "Invalid friend request");
-    }
-
-    const requester = await User.findById(requesterId);
-    if (!requester) {
-      throw createHttpError(404, "User not found");
-    }
-
-    if (
-      isBlockedRelation(req.user, requesterId) ||
-      isBlockedRelation(requester, recipientId)
-    ) {
-      throw createHttpError(403, "Action not allowed");
-    }
-
-    const hasPendingRequest = hasUserId(
-      req.user.friendRequestsReceived,
-      requesterId,
-    );
-    if (!hasPendingRequest && !hasUserId(req.user.friends, requesterId)) {
-      throw createHttpError(400, "Friend request not found");
-    }
-
-    req.user.friendRequestsReceived = removeUserId(
-      req.user.friendRequestsReceived,
-      requesterId,
-    );
-    requester.friendRequestsSent = removeUserId(
-      requester.friendRequestsSent,
-      recipientId,
-    );
-
-    addUniqueUserId(req.user.friends, requesterId);
-    addUniqueUserId(requester.friends, recipientId);
-
-    addUniqueUserId(req.user.followers, requesterId);
-    addUniqueUserId(req.user.following, requesterId);
-    addUniqueUserId(requester.followers, recipientId);
-    addUniqueUserId(requester.following, recipientId);
-
-    await Promise.all([req.user.save(), requester.save()]);
-
-    const pendingNotification = await Notification.findOne({
-      user: req.user._id,
-      type: "friend_request",
-      "data.fromUserId": requesterId,
-      "data.status": "pending",
-    }).sort({ createdAt: -1 });
-
-    if (pendingNotification) {
-      pendingNotification.read = true;
-      pendingNotification.data = {
-        ...(pendingNotification.data || {}),
-        status: "accepted",
-      };
-      await pendingNotification.save();
-    }
-
-    await createUserNotification({
-      userId: requester._id,
-      type: "friend_request_accepted",
-      title: `${req.user.name || "Someone"} accepted your friend request`,
-      body: "You are now friends.",
-      data: {
-        type: "friend_request_accepted",
-        userId: recipientId,
-        userName: req.user.name || "",
-      },
-      push: {
-        enabled: true,
-        tokens: requester.expoPushTokens || [],
-        channelId: "messages",
-      },
-    });
-
-    return res.status(200).json({
-      status: "accepted",
-      friendsCount: req.user.friends.length,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const getFriends = async (req, res, next) => {
-  try {
-    const user = await User.findById(req.params.userId).populate(
-      "friends",
-      "name username avatarUrl bio",
-    );
-    if (!user) {
-      throw createHttpError(404, "User not found");
-    }
-
-    const friends = (user.friends || []).map((friend) => ({
-      id: friend._id.toString(),
-      name: friend.name,
-      username: friend.username || "",
-      avatarUrl: friend.avatarUrl || "",
-      bio: friend.bio || "",
-    }));
-
-    return res.status(200).json({ users: friends });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const unfriendUser = async (req, res, next) => {
-  try {
-    const currentUserId = req.user._id.toString();
-    const targetUserId = req.params.userId;
-
-    if (currentUserId === targetUserId) {
-      throw createHttpError(400, "Cannot unfriend yourself");
-    }
-
-    const targetUser = await User.findById(targetUserId);
-    if (!targetUser) {
-      throw createHttpError(404, "User not found");
-    }
-
-    req.user.friends = removeUserId(req.user.friends, targetUserId);
-    targetUser.friends = removeUserId(targetUser.friends, currentUserId);
-
-    req.user.friendRequestsSent = removeUserId(
-      req.user.friendRequestsSent,
-      targetUserId,
-    );
-    req.user.friendRequestsReceived = removeUserId(
-      req.user.friendRequestsReceived,
-      targetUserId,
-    );
-    targetUser.friendRequestsSent = removeUserId(
-      targetUser.friendRequestsSent,
-      currentUserId,
-    );
-    targetUser.friendRequestsReceived = removeUserId(
-      targetUser.friendRequestsReceived,
-      currentUserId,
-    );
-
-    await Promise.all([req.user.save(), targetUser.save()]);
-
-    return res.status(200).json({
-      status: "unfriended",
-      friendsCount: req.user.friends.length,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const blockUser = async (req, res, next) => {
-  try {
-    const currentUserId = req.user._id.toString();
-    const targetUserId = req.params.userId;
-
-    if (currentUserId === targetUserId) {
-      throw createHttpError(400, "Cannot block yourself");
-    }
-
-    const targetUser = await User.findById(targetUserId);
-    if (!targetUser) {
-      throw createHttpError(404, "User not found");
-    }
-
-    addUniqueUserId(req.user.blockedUsers, targetUserId);
-
-    req.user.friends = removeUserId(req.user.friends, targetUserId);
-    targetUser.friends = removeUserId(targetUser.friends, currentUserId);
-
-    req.user.following = removeUserId(req.user.following, targetUserId);
-    req.user.followers = removeUserId(req.user.followers, targetUserId);
-    targetUser.following = removeUserId(targetUser.following, currentUserId);
-    targetUser.followers = removeUserId(targetUser.followers, currentUserId);
-
-    req.user.friendRequestsSent = removeUserId(
-      req.user.friendRequestsSent,
-      targetUserId,
-    );
-    req.user.friendRequestsReceived = removeUserId(
-      req.user.friendRequestsReceived,
-      targetUserId,
-    );
-    targetUser.friendRequestsSent = removeUserId(
-      targetUser.friendRequestsSent,
-      currentUserId,
-    );
-    targetUser.friendRequestsReceived = removeUserId(
-      targetUser.friendRequestsReceived,
-      currentUserId,
-    );
-
-    await Promise.all([req.user.save(), targetUser.save()]);
-
-    return res.status(200).json({
-      status: "blocked",
-      blockedUserId: targetUserId,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const getBlockedUsers = async (req, res, next) => {
-  try {
-    const blockedIds = Array.isArray(req.user.blockedUsers)
-      ? req.user.blockedUsers.map(toIdString)
-      : [];
-
-    if (blockedIds.length === 0) {
-      return res.status(200).json({ users: [] });
-    }
-
-    const blockedUsers = await User.find({
-      _id: { $in: blockedIds },
-    })
-      .select("name username avatarUrl bio")
-      .lean();
-
-    const byId = new Map(
-      blockedUsers.map((item) => [item._id.toString(), item]),
-    );
-    const users = blockedIds
-      .map((id) => byId.get(id))
-      .filter(Boolean)
-      .map((item) => ({
-        id: item._id.toString(),
-        name: item.name || "User",
-        username: item.username || "",
-        avatarUrl: item.avatarUrl || "",
-        bio: item.bio || "",
-      }));
-
-    return res.status(200).json({ users });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const unblockUser = async (req, res, next) => {
-  try {
-    const currentUserId = req.user._id.toString();
-    const targetUserId = req.params.userId;
-
-    if (currentUserId === targetUserId) {
-      throw createHttpError(400, "Cannot unblock yourself");
-    }
-
-    const targetUser = await User.findById(targetUserId).select("_id");
-    if (!targetUser) {
-      throw createHttpError(404, "User not found");
-    }
-
-    req.user.blockedUsers = removeUserId(req.user.blockedUsers, targetUserId);
-    await req.user.save();
-
-    return res.status(200).json({
-      status: "unblocked",
-      unblockedUserId: targetUserId,
     });
   } catch (error) {
     return next(error);
@@ -935,13 +639,21 @@ const getFollowers = async (req, res, next) => {
     if (!user) {
       throw createHttpError(404, "User not found");
     }
+    if (!isUserActive(user)) {
+      throw createHttpError(404, "User not found");
+    }
+    if (isAdminUser(user)) {
+      throw createHttpError(404, "User not found");
+    }
 
-    const followers = (user.followers || []).map((u) => ({
-      id: u._id.toString(),
-      name: u.name,
-      avatarUrl: u.avatarUrl || "",
-      bio: u.bio || "",
-    }));
+    const friendshipStatusMap = await buildFriendshipStatusMap(
+      req.user,
+      (user.followers || []).map((u) => u._id),
+    );
+
+    const followers = (user.followers || []).map((u) =>
+      mapUserPreview(u, friendshipStatusMap[normalizeId(u._id)]),
+    );
 
     return res.status(200).json({ users: followers });
   } catch (error) {
@@ -958,13 +670,21 @@ const getFollowing = async (req, res, next) => {
     if (!user) {
       throw createHttpError(404, "User not found");
     }
+    if (!isUserActive(user)) {
+      throw createHttpError(404, "User not found");
+    }
+    if (isAdminUser(user)) {
+      throw createHttpError(404, "User not found");
+    }
 
-    const following = (user.following || []).map((u) => ({
-      id: u._id.toString(),
-      name: u.name,
-      avatarUrl: u.avatarUrl || "",
-      bio: u.bio || "",
-    }));
+    const friendshipStatusMap = await buildFriendshipStatusMap(
+      req.user,
+      (user.following || []).map((u) => u._id),
+    );
+
+    const following = (user.following || []).map((u) =>
+      mapUserPreview(u, friendshipStatusMap[normalizeId(u._id)]),
+    );
 
     return res.status(200).json({ users: following });
   } catch (error) {
@@ -973,25 +693,20 @@ const getFollowing = async (req, res, next) => {
 };
 
 module.exports = {
-  checkUsernameAvailability,
   register,
   login,
+  refreshSession,
+  logout,
   getMe,
-  savePushToken,
-  removePushToken,
-  getMyPushTokensDebug,
   updateProfile,
   changePassword,
   deleteAccount,
+  getRecentSearches,
+  saveRecentSearch,
+  deleteRecentSearch,
+  clearRecentSearches,
   searchUsers,
   getUserProfile,
-  sendFriendRequest,
-  acceptFriendRequest,
-  unfriendUser,
-  blockUser,
-  getBlockedUsers,
-  unblockUser,
-  getFriends,
   toggleFollow,
   getFollowers,
   getFollowing,

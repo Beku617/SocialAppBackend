@@ -1,24 +1,20 @@
 const express = require("express");
-const { body, param, query } = require("express-validator");
+const { body, param } = require("express-validator");
 const {
-  checkUsernameAvailability,
   getMe,
   login,
+  logout,
+  refreshSession,
   register,
-  savePushToken,
-  removePushToken,
   updateProfile,
   changePassword,
   deleteAccount,
+  getRecentSearches,
+  saveRecentSearch,
+  deleteRecentSearch,
+  clearRecentSearches,
   searchUsers,
   getUserProfile,
-  sendFriendRequest,
-  acceptFriendRequest,
-  unfriendUser,
-  blockUser,
-  unblockUser,
-  getBlockedUsers,
-  getFriends,
   toggleFollow,
   getFollowers,
   getFollowing,
@@ -31,13 +27,13 @@ const router = express.Router();
 router.post(
   "/register",
   [
-    body("email").trim().isEmail().withMessage("Provide a valid email"),
     body("username")
       .trim()
-      .matches(/^[a-zA-Z0-9._]{3,30}$/)
-      .withMessage(
-        "Username must be 3-30 chars and use letters, numbers, dot, or underscore",
-      ),
+      .isLength({ min: 3, max: 32 })
+      .withMessage("Username must be 3-32 chars")
+      .matches(/^[a-zA-Z0-9_.]+$/)
+      .withMessage("Username can only include letters, numbers, underscore, and dot"),
+    body("email").trim().isEmail().withMessage("Provide a valid email"),
     body("password")
       .isString()
       .isLength({ min: 8, max: 64 })
@@ -47,64 +43,59 @@ router.post(
   register,
 );
 
-router.get(
-  "/username/check",
-  [
-    query("username")
-      .optional({ values: "falsy" })
-      .isString()
-      .withMessage("username must be a string"),
-    validateRequest,
-  ],
-  checkUsernameAvailability,
-);
-
 router.post(
   "/login",
   [
-    body("email")
+    body("identifier")
+      .optional()
       .trim()
-      .isLength({ min: 1 })
-      .withMessage("Provide an email or username"),
+      .notEmpty()
+      .withMessage("Username or email is required"),
+    body("email")
+      .optional()
+      .trim()
+      .isEmail()
+      .withMessage("Provide a valid email"),
     body("password").isString().notEmpty().withMessage("Password is required"),
+    body().custom((value) => {
+      const hasIdentifier =
+        typeof value.identifier === "string" && value.identifier.trim().length > 0;
+      const hasEmail = typeof value.email === "string" && value.email.trim().length > 0;
+      if (!hasIdentifier && !hasEmail) {
+        throw new Error("Username or email is required");
+      }
+      return true;
+    }),
     validateRequest,
   ],
   login,
 );
 
-router.get("/me", requireAuth, getMe);
+router.post(
+  "/refresh",
+  [
+    body("refreshToken")
+      .trim()
+      .notEmpty()
+      .withMessage("Refresh token is required"),
+    validateRequest,
+  ],
+  refreshSession,
+);
 
 router.post(
-  "/push-token",
-  requireAuth,
+  "/logout",
   [
-    body().custom((_, { req }) => {
-      const token = String(req.body?.token || req.body?.pushToken || "").trim();
-      if (!token) {
-        throw new Error("Push token is required");
-      }
-      return true;
-    }),
+    body("refreshToken")
+      .optional()
+      .isString()
+      .withMessage("Refresh token must be a string"),
     validateRequest,
   ],
-  savePushToken,
+  logout,
 );
 
-router.delete(
-  "/push-token",
-  requireAuth,
-  [
-    body().custom((_, { req }) => {
-      const token = String(req.body?.token || req.body?.pushToken || "").trim();
-      if (!token) {
-        throw new Error("Push token is required");
-      }
-      return true;
-    }),
-    validateRequest,
-  ],
-  removePushToken,
-);
+router.get("/me", requireAuth, getMe);
 
 router.put(
   "/me",
@@ -151,46 +142,66 @@ router.delete("/me", requireAuth, deleteAccount);
 // Search users
 router.get("/users/search", requireAuth, searchUsers);
 
+router.get("/search/recent", requireAuth, getRecentSearches);
+
+router.post(
+  "/search/recent",
+  requireAuth,
+  [
+    body("kind")
+      .isIn(["query", "user"])
+      .withMessage("kind must be query or user"),
+    body("query")
+      .if(body("kind").equals("query"))
+      .trim()
+      .isLength({ min: 1, max: 120 })
+      .withMessage("Query must be 1-120 chars"),
+    body("userId")
+      .if(body("kind").equals("user"))
+      .isMongoId()
+      .withMessage("Invalid user id"),
+    validateRequest,
+  ],
+  saveRecentSearch,
+);
+
+router.delete("/search/recent", requireAuth, clearRecentSearches);
+
+router.delete(
+  "/search/recent/:searchId",
+  requireAuth,
+  [param("searchId").isMongoId().withMessage("Invalid recent search id"), validateRequest],
+  deleteRecentSearch,
+);
+
 // Public profile
-router.get("/users/:userId", requireAuth, getUserProfile);
+router.get(
+  "/users/:userId",
+  requireAuth,
+  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
+  getUserProfile,
+);
 
 // Follow / unfollow
-router.post("/users/:userId/follow", requireAuth, toggleFollow);
 router.post(
-  "/users/:userId/friend-request",
+  "/users/:userId/follow",
   requireAuth,
   [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
-  sendFriendRequest,
+  toggleFollow,
 );
-router.post(
-  "/users/:userId/friend-accept",
-  requireAuth,
-  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
-  acceptFriendRequest,
-);
-router.post(
-  "/users/:userId/unfriend",
-  requireAuth,
-  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
-  unfriendUser,
-);
-router.post(
-  "/users/:userId/block",
-  requireAuth,
-  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
-  blockUser,
-);
-router.post(
-  "/users/:userId/unblock",
-  requireAuth,
-  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
-  unblockUser,
-);
-router.get("/users/me/blocked", requireAuth, getBlockedUsers);
 
 // Followers & following lists
-router.get("/users/:userId/followers", requireAuth, getFollowers);
-router.get("/users/:userId/following", requireAuth, getFollowing);
-router.get("/users/:userId/friends", requireAuth, getFriends);
+router.get(
+  "/users/:userId/followers",
+  requireAuth,
+  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
+  getFollowers,
+);
+router.get(
+  "/users/:userId/following",
+  requireAuth,
+  [param("userId").isMongoId().withMessage("Invalid user id"), validateRequest],
+  getFollowing,
+);
 
 module.exports = router;

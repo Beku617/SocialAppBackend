@@ -1,25 +1,21 @@
+const path = require("path");
+const fs = require("fs/promises");
 const mongoose = require("mongoose");
 const Reel = require("../models/Reel");
-const ReelReport = require("../models/ReelReport");
 const User = require("../models/User");
-const Notification = require("../models/Notification");
 const { createHttpError } = require("../utils/httpError");
-const { createUserNotification } = require("../utils/notificationCenter");
 const {
-  canViewerSeeContent,
-  normalizeVisibilityForRead,
-  normalizeVisibilityInput,
-} = require("../utils/visibility");
-const cloudinary = require("../config/cloudinary");
-const { env } = require("../config/env");
-const REEL_UPLOAD_LIMIT_BYTES = 40 * 1024 * 1024; // 40MB
-const CLOUDINARY_UPLOAD_TIMEOUT_MS = Math.max(
-  Number(env.REELS_UPLOAD_TIMEOUT_MS) || 0,
-  120000,
-);
-const CLOUDINARY_UPLOAD_CHUNK_SIZE = 6000000;
-const CLOUDINARY_UPLOAD_MAX_ATTEMPTS = 3;
-const CLOUDINARY_UPLOAD_RETRY_BASE_DELAY_MS = 1000;
+  buildVisibleAppUserQuery,
+  isVisibleUserId,
+} = require("../utils/contentVisibility");
+const {
+  deleteNotifications,
+  replaceNotification,
+} = require("../utils/notifications");
+
+const ALLOWED_VISIBILITY = ["public", "followers", "private"];
+const LOCAL_REEL_UPLOAD_LIMIT_BYTES = 40 * 1024 * 1024; // 40MB
+const UPLOADS_ROOT = path.join(__dirname, "../../uploads");
 
 const DEMO_REELS = [
   {
@@ -89,22 +85,26 @@ const toIdString = (value) => {
 const arrayHasUser = (values, userId) =>
   Array.isArray(values) && values.some((value) => toIdString(value) === userId);
 
-const buildBlockedIdSet = (user) =>
-  new Set(
-    Array.isArray(user?.blockedUsers) ? user.blockedUsers.map(toIdString) : [],
-  );
-
-const canViewerSeeReel = (reel, currentUserId, friendIdSet) => {
-  return canViewerSeeContent({
-    visibility: reel?.visibility,
-    authorId: toIdString(reel?.author),
-    viewerId: currentUserId,
-    friendIdSet,
-    allowFollowers: true,
-  });
+/**
+ * Rebuild a local /uploads/ URL so it always uses the *current* request host.
+ * External URLs (e.g. samplelib.com) are returned unchanged.
+ */
+const resolveLocalUrl = (url, storageKey, req) => {
+  // If there is a storageKey that lives under our uploads folder, always
+  // build the URL from the current request so it survives IP changes.
+  if (
+    storageKey &&
+    storageKey.startsWith("reels/") &&
+    !storageKey.startsWith("reels/demo/")
+  ) {
+    const protocol = req.protocol || "http";
+    const host = req.get("host");
+    return `${protocol}://${host}/uploads/${storageKey}`;
+  }
+  return url || "";
 };
 
-const mapReel = (reel, currentUserId) => {
+const mapReel = (reel, currentUserId, req) => {
   const authorId = toIdString(reel.author);
   const authorName = reel.author?.name || "Unknown";
   const authorAvatar = reel.author?.avatarUrl || "";
@@ -119,9 +119,6 @@ const mapReel = (reel, currentUserId) => {
     : reel.viewers?.length || 0;
 
   const storageKey = reel.storageKey || "";
-  const normalizedVisibility = normalizeVisibilityForRead(reel.visibility, {
-    allowFollowers: true,
-  });
 
   return {
     id: reel._id.toString(),
@@ -133,13 +130,17 @@ const mapReel = (reel, currentUserId) => {
     caption: reel.caption || "",
     music: reel.music || "",
     storageKey,
-    originalUrl: reel.originalUrl || "",
-    playbackUrl: reel.playbackUrl || "",
+    originalUrl: req
+      ? resolveLocalUrl(reel.originalUrl, storageKey, req)
+      : reel.originalUrl || "",
+    playbackUrl: req
+      ? resolveLocalUrl(reel.playbackUrl, storageKey, req)
+      : reel.playbackUrl || "",
     thumbUrl: reel.thumbUrl || "",
     duration: reel.duration || 0,
     width: reel.width || 0,
     height: reel.height || 0,
-    visibility: normalizedVisibility,
+    visibility: reel.visibility,
     status: reel.status,
     failureReason: reel.failureReason || "",
     likesCount,
@@ -158,229 +159,62 @@ const mapReel = (reel, currentUserId) => {
 };
 
 const normalizeVisibility = (value) => {
-  return normalizeVisibilityInput(value, {
-    allowFollowers: true,
-    errorMessage: "Invalid visibility",
-  });
-};
-
-const sleep = (ms) =>
-  new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-
-const isCloudinaryTimeoutError = (error) => {
-  if (!error) return false;
-
-  const message = String(error.message || "").toLowerCase();
-  const name = String(error.name || "").toLowerCase();
-  const httpCode = Number(error.http_code || error.httpCode || error.statusCode);
-
-  return (
-    httpCode === 499 ||
-    httpCode === 504 ||
-    name.includes("timeout") ||
-    message.includes("request timeout") ||
-    message.includes("timed out") ||
-    message.includes("etimedout")
-  );
-};
-
-const isRetryableCloudinaryError = (error) => {
-  if (!error) return false;
-  if (isCloudinaryTimeoutError(error)) return true;
-
-  const message = String(error.message || "").toLowerCase();
-  const httpCode = Number(error.http_code || error.httpCode || error.statusCode);
-
-  return (
-    !httpCode ||
-    httpCode >= 500 ||
-    message.includes("econnreset") ||
-    message.includes("socket hang up") ||
-    message.includes("network")
-  );
-};
-
-const mapCloudinaryUploadError = (error, attempts) => {
-  const message = error?.message || "unknown error";
-  const retryable = isRetryableCloudinaryError(error);
-
-  if (isCloudinaryTimeoutError(error)) {
-    return createHttpError(
-      504,
-      `Video upload to Cloudinary timed out after ${CLOUDINARY_UPLOAD_TIMEOUT_MS}ms. Please retry.`,
-      {
-        code: "CLOUDINARY_UPLOAD_TIMEOUT",
-        attempts,
-        retryable,
-        upstreamMessage: message,
-      },
-    );
+  if (!value) return "public";
+  const normalized = String(value).toLowerCase();
+  if (!ALLOWED_VISIBILITY.includes(normalized)) {
+    throw createHttpError(400, "Invalid visibility");
   }
-
-  return createHttpError(
-    502,
-    "Video upload to Cloudinary failed. Please retry.",
-    {
-      code: "CLOUDINARY_UPLOAD_FAILED",
-      attempts,
-      retryable,
-      upstreamMessage: message,
-    },
-  );
+  return normalized;
 };
 
-const isCloudinaryConfigured = () =>
-  Boolean(
-    env.CLOUDINARY_CLOUD_NAME &&
-      env.CLOUDINARY_API_KEY &&
-      env.CLOUDINARY_API_SECRET,
-  );
-
-const buildCloudinaryPublicId = ({ userId, reelId }) =>
-  `${userId}/${reelId}/original`;
-const buildCloudinaryUploadPublicId = ({ userId, reelId }) =>
-  `reels/${buildCloudinaryPublicId({ userId, reelId })}`;
-
-const buildStorageKeyFromPublicId = (publicId) => `cloudinary:${publicId}`;
-
-const pickFirstNonEmptyString = (...values) => {
-  for (const value of values) {
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-  }
-  return "";
-};
-
-const uploadVideoBufferToCloudinary = async ({
-  buffer,
-  mimeType,
-  fileName,
-  userId,
-  reelId,
-}) => {
-  if (!isCloudinaryConfigured()) {
-    throw createHttpError(
-      500,
-      "Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.",
-    );
-  }
-
-  const publicId = buildCloudinaryPublicId({ userId, reelId });
-  const formatFromMime =
+const buildStorageKey = ({ userId, reelId, fileName, mimeType }) => {
+  const safeName =
+    typeof fileName === "string" && fileName.trim()
+      ? fileName.trim()
+      : "original";
+  const parsed = path.parse(safeName);
+  const extensionFromName = parsed.ext?.replace(".", "");
+  const extensionFromMime =
     typeof mimeType === "string" && mimeType.includes("/")
-      ? mimeType.split("/")[1].toLowerCase()
-      : "";
-  const uploadOptions = {
-    resource_type: "video",
-    folder: "reels",
-    public_id: publicId,
-    overwrite: true,
-    quality: "auto",
-    fetch_format: "auto",
-    timeout: CLOUDINARY_UPLOAD_TIMEOUT_MS,
-    chunk_size: CLOUDINARY_UPLOAD_CHUNK_SIZE,
-    ...(fileName ? { filename: fileName } : {}),
-    ...(formatFromMime ? { format: formatFromMime } : {}),
-    eager: [
-      {
-        format: "jpg",
-        width: 720,
-        crop: "limit",
-        start_offset: "1",
-      },
-    ],
-  };
+      ? mimeType.split("/")[1]
+      : "mp4";
+  const ext = (extensionFromName || extensionFromMime || "mp4")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
 
-  let lastError;
-
-  for (let attempt = 1; attempt <= CLOUDINARY_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
-    try {
-      const result = await new Promise((resolve, reject) => {
-        const uploadStream = cloudinary.uploader.upload_chunked_stream(
-          uploadOptions,
-          (error, uploaded) => {
-            if (error) {
-              return reject(error);
-            }
-            if (!uploaded) {
-              return reject(new Error("Cloudinary upload failed: empty response."));
-            }
-            return resolve(uploaded);
-          },
-        );
-
-        uploadStream.on("error", reject);
-        uploadStream.end(buffer);
-      });
-
-      return result;
-    } catch (error) {
-      lastError = error;
-      const retryable = isRetryableCloudinaryError(error);
-
-      console.warn("[reels] cloudinary upload attempt failed", {
-        reelId,
-        attempt,
-        maxAttempts: CLOUDINARY_UPLOAD_MAX_ATTEMPTS,
-        timeoutMs: CLOUDINARY_UPLOAD_TIMEOUT_MS,
-        chunkSize: CLOUDINARY_UPLOAD_CHUNK_SIZE,
-        error: error?.message || String(error),
-        timeout: isCloudinaryTimeoutError(error),
-        retryable,
-      });
-
-      if (retryable && attempt < CLOUDINARY_UPLOAD_MAX_ATTEMPTS) {
-        await sleep(CLOUDINARY_UPLOAD_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
-        continue;
-      }
-
-      break;
-    }
-  }
-
-  throw mapCloudinaryUploadError(lastError, CLOUDINARY_UPLOAD_MAX_ATTEMPTS);
+  return `reels/${userId}/${reelId}/original.${ext || "mp4"}`;
 };
 
-const getCloudinaryPublicIdFromReel = (reel) => {
-  if (typeof reel.cloudinaryPublicId === "string" && reel.cloudinaryPublicId.trim()) {
-    return reel.cloudinaryPublicId.trim();
-  }
-  if (typeof reel.storageKey === "string" && reel.storageKey.startsWith("cloudinary:")) {
-    return reel.storageKey.replace("cloudinary:", "").trim();
-  }
-  return "";
+const buildUploadUrl = (storageKey) => {
+  const template = process.env.REELS_UPLOAD_URL_TEMPLATE || "";
+  if (!template) return "";
+  return template.replace("{storageKey}", encodeURIComponent(storageKey));
 };
 
-const deleteCloudinaryVideo = async (publicId) => {
-  if (!publicId || !isCloudinaryConfigured()) return;
-
-  try {
-    await cloudinary.uploader.destroy(publicId, { resource_type: "video" });
-  } catch (error) {
-    console.warn("[reels] failed to delete Cloudinary asset", {
-      publicId,
-      error: error?.message || String(error),
-    });
-  }
-};
+const getVisibleUserIds = async () =>
+  User.distinct("_id", buildVisibleAppUserQuery());
 
 const listReels = async (req, res, next) => {
   try {
     const currentUserId = req.user._id.toString();
     const tab = req.query.tab === "friends" ? "friends" : "reels";
-    const friendIds = (req.user.friends || []).map((id) => id.toString());
-    const blockedIdSet = buildBlockedIdSet(req.user);
+    const followingIds = (req.user.following || []).map((id) => id.toString());
+    const visibleUserIds = await getVisibleUserIds();
+    const visibleUserIdSet = new Set(visibleUserIds.map((id) => id.toString()));
+    const visibleFollowingIds = followingIds
+      .filter((id) => visibleUserIdSet.has(id))
+      .map((id) => new mongoose.Types.ObjectId(id));
 
     let visibilityFilter;
     if (tab === "friends") {
       visibilityFilter = {
-        author: {
-          $in: friendIds.map((id) => new mongoose.Types.ObjectId(id)),
-        },
-        visibility: { $in: ["public", "friends", "followers"] },
+        $or: [
+          { author: req.user._id },
+          {
+            author: { $in: visibleFollowingIds },
+            visibility: { $in: ["public", "followers"] },
+          },
+        ],
       };
     } else {
       visibilityFilter = {
@@ -388,16 +222,15 @@ const listReels = async (req, res, next) => {
           { author: req.user._id },
           { visibility: "public" },
           {
-            author: {
-              $in: friendIds.map((id) => new mongoose.Types.ObjectId(id)),
-            },
-            visibility: { $in: ["friends", "followers"] },
+            author: { $in: visibleFollowingIds },
+            visibility: "followers",
           },
         ],
       };
     }
 
     const reels = await Reel.find({
+      author: { $in: visibleUserIds },
       status: "ready",
       storageKey: { $not: /^reels\/demo\// },
       ...visibilityFilter,
@@ -406,12 +239,8 @@ const listReels = async (req, res, next) => {
       .limit(80)
       .populate("author", "name avatarUrl");
 
-    const filteredReels = reels.filter(
-      (reel) => !blockedIdSet.has(toIdString(reel.author)),
-    );
-
     return res.status(200).json({
-      reels: filteredReels.map((reel) => mapReel(reel, currentUserId)),
+      reels: reels.map((reel) => mapReel(reel, currentUserId, req)),
     });
   } catch (error) {
     return next(error);
@@ -427,37 +256,30 @@ const listMyReels = async (req, res, next) => {
       .populate("author", "name avatarUrl");
 
     return res.status(200).json({
-      reels: reels.map((reel) => mapReel(reel, currentUserId)),
+      reels: reels.map((reel) => mapReel(reel, currentUserId, req)),
     });
   } catch (error) {
     return next(error);
   }
 };
 
-const listSavedReels = async (req, res, next) => {
+const getReel = async (req, res, next) => {
   try {
-    const currentUserId = req.user._id.toString();
-    const friendIdSet = new Set(
-      (req.user.friends || []).map((id) => id.toString()),
+    const reel = await Reel.findById(req.params.reelId).populate(
+      "author",
+      "name avatarUrl",
     );
-    const blockedIdSet = buildBlockedIdSet(req.user);
 
-    const reels = await Reel.find({
-      status: "ready",
-      saves: req.user._id,
-    })
-      .sort({ updatedAt: -1 })
-      .limit(120)
-      .populate("author", "name avatarUrl");
+    if (!reel || reel.status !== "ready") {
+      throw createHttpError(404, "Reel not found");
+    }
 
-    const visibleReels = reels.filter((reel) => {
-      const authorId = toIdString(reel.author);
-      if (blockedIdSet.has(authorId)) return false;
-      return canViewerSeeReel(reel, currentUserId, friendIdSet);
-    });
+    if (!(await isVisibleUserId(User, reel.author))) {
+      throw createHttpError(404, "Reel not found");
+    }
 
     return res.status(200).json({
-      reels: visibleReels.map((reel) => mapReel(reel, currentUserId)),
+      reel: mapReel(reel, req.user._id.toString(), req),
     });
   } catch (error) {
     return next(error);
@@ -471,6 +293,8 @@ const initiateUpload = async (req, res, next) => {
     const music =
       typeof req.body.music === "string" ? req.body.music.trim() : "";
     const visibility = normalizeVisibility(req.body.visibility);
+    const fileName = req.body.fileName;
+    const mimeType = req.body.mimeType;
 
     const reel = await Reel.create({
       author: req.user._id,
@@ -480,81 +304,32 @@ const initiateUpload = async (req, res, next) => {
       status: "uploading",
     });
 
-    const cloudinaryPublicId = buildCloudinaryUploadPublicId({
+    const storageKey = buildStorageKey({
       userId: req.user._id.toString(),
       reelId: reel._id.toString(),
+      fileName,
+      mimeType,
     });
-    const storageKey = buildStorageKeyFromPublicId(cloudinaryPublicId);
 
-    reel.cloudinaryPublicId = cloudinaryPublicId;
     reel.storageKey = storageKey;
     await reel.save();
     await reel.populate("author", "name avatarUrl");
 
+    const uploadUrl = buildUploadUrl(storageKey);
+
     return res.status(201).json({
-      reel: mapReel(reel, req.user._id.toString()),
+      reel: mapReel(reel, req.user._id.toString(), req),
       upload: {
         storageKey,
-        cloudinaryPublicId,
         method: "PUT",
-        uploadUrl: "",
+        uploadUrl,
         headers: {
-          "Content-Type": "video/mp4",
+          "Content-Type": mimeType || "video/mp4",
         },
-        note: "Upload media through /api/reels/:reelId/uploads/local. Server stores it in Cloudinary.",
+        note: uploadUrl
+          ? "Use this signed URL to upload directly to object storage."
+          : "Configure REELS_UPLOAD_URL_TEMPLATE to return real signed URLs.",
       },
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const signUpload = async (req, res, next) => {
-  try {
-    if (!isCloudinaryConfigured()) {
-      throw createHttpError(
-        500,
-        "Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.",
-      );
-    }
-
-    const reelId = req.body?.reelId;
-    const reel = await Reel.findById(reelId).select("_id author");
-
-    if (!reel) {
-      throw createHttpError(404, "Reel not found");
-    }
-    if (reel.author.toString() !== req.user._id.toString()) {
-      throw createHttpError(403, "You can manage only your own reels");
-    }
-
-    const timestamp = Math.floor(Date.now() / 1000);
-    const uploadPreset =
-      typeof env.CLOUDINARY_REELS_UPLOAD_PRESET === "string"
-        ? env.CLOUDINARY_REELS_UPLOAD_PRESET.trim()
-        : "";
-    const publicId = buildCloudinaryUploadPublicId({
-      userId: req.user._id.toString(),
-      reelId: reel._id.toString(),
-    });
-    const paramsToSign = {
-      timestamp,
-      public_id: publicId,
-      overwrite: "true",
-      ...(uploadPreset ? { upload_preset: uploadPreset } : {}),
-    };
-    const signature = cloudinary.utils.api_sign_request(
-      paramsToSign,
-      env.CLOUDINARY_API_SECRET,
-    );
-
-    return res.status(200).json({
-      signature,
-      timestamp,
-      cloudName: env.CLOUDINARY_CLOUD_NAME,
-      apiKey: env.CLOUDINARY_API_KEY,
-      uploadPreset,
-      publicId,
     });
   } catch (error) {
     return next(error);
@@ -576,55 +351,25 @@ const completeUpload = async (req, res, next) => {
       throw createHttpError(403, "You can manage only your own reels");
     }
 
-    const publicId = pickFirstNonEmptyString(
-      req.body?.public_id,
-      req.body?.publicId,
-      req.body?.cloudinaryPublicId,
-    );
-    const secureUrl = pickFirstNonEmptyString(
-      req.body?.secure_url,
-      req.body?.secureUrl,
-      req.body?.originalUrl,
-    );
-    const thumbUrl = pickFirstNonEmptyString(req.body?.thumb_url, req.body?.thumbUrl);
+    const storageKey =
+      typeof req.body.storageKey === "string" ? req.body.storageKey.trim() : "";
+    const originalUrl =
+      typeof req.body.originalUrl === "string"
+        ? req.body.originalUrl.trim()
+        : "";
 
-    if ((publicId && !secureUrl) || (!publicId && secureUrl)) {
-      throw createHttpError(
-        400,
-        "Both public_id and secure_url are required to complete direct upload.",
-      );
+    if (storageKey) {
+      reel.storageKey = storageKey;
     }
-
-    if (publicId && secureUrl) {
-      const expectedPrefix = `reels/${req.user._id.toString()}/${reel._id.toString()}/`;
-      if (!publicId.startsWith(expectedPrefix)) {
-        throw createHttpError(400, "Invalid Cloudinary public_id for this reel.");
-      }
-
-      reel.cloudinaryPublicId = publicId;
-      reel.storageKey = buildStorageKeyFromPublicId(publicId);
-      reel.originalUrl = secureUrl;
-      reel.playbackUrl = secureUrl;
-      if (thumbUrl) {
-        reel.thumbUrl = thumbUrl;
-      }
+    if (originalUrl) {
+      reel.originalUrl = originalUrl;
     }
-
-    if (!reel.originalUrl || !getCloudinaryPublicIdFromReel(reel)) {
-      throw createHttpError(
-        400,
-        "Cloudinary upload is not completed for this reel yet.",
-      );
-    }
-
-    if (reel.status !== "ready") {
-      reel.status = "processing";
-    }
+    reel.status = "processing";
     reel.failureReason = "";
     await reel.save();
 
     return res.status(200).json({
-      reel: mapReel(reel, req.user._id.toString()),
+      reel: mapReel(reel, req.user._id.toString(), req),
     });
   } catch (error) {
     return next(error);
@@ -646,13 +391,11 @@ const markReady = async (req, res, next) => {
       throw createHttpError(403, "You can manage only your own reels");
     }
 
-    reel.playbackUrl =
-      typeof reel.originalUrl === "string" && reel.originalUrl.trim()
-        ? reel.originalUrl.trim()
-        : req.body.playbackUrl.trim();
-    if (typeof req.body.thumbUrl === "string" && req.body.thumbUrl.trim()) {
-      reel.thumbUrl = req.body.thumbUrl.trim();
-    }
+    reel.playbackUrl = req.body.playbackUrl.trim();
+    reel.thumbUrl =
+      typeof req.body.thumbUrl === "string"
+        ? req.body.thumbUrl.trim()
+        : reel.thumbUrl;
     reel.duration = Number.isFinite(req.body.duration)
       ? Number(req.body.duration)
       : reel.duration;
@@ -671,37 +414,8 @@ const markReady = async (req, res, next) => {
 
     await reel.save();
 
-    const ownerId = req.user._id.toString();
-    const reelIdValue = reel._id.toString();
-    const existingNotification = await Notification.findOne({
-      user: req.user._id,
-      type: "reel_upload_complete",
-      "data.reelId": reelIdValue,
-    }).lean();
-
-    if (!existingNotification) {
-      const owner = await User.findById(ownerId).select("expoPushTokens");
-      await createUserNotification({
-        userId: ownerId,
-        type: "reel_upload_complete",
-        title: "Reel upload complete",
-        body: reel.caption
-          ? `Your reel is ready: ${reel.caption.slice(0, 120)}`
-          : "Your reel is now ready to watch.",
-        data: {
-          type: "reel_upload_complete",
-          reelId: reelIdValue,
-        },
-        push: {
-          enabled: false,
-          tokens: owner?.expoPushTokens || [],
-          channelId: "messages",
-        },
-      });
-    }
-
     return res.status(200).json({
-      reel: mapReel(reel, req.user._id.toString()),
+      reel: mapReel(reel, req.user._id.toString(), req),
     });
   } catch (error) {
     return next(error);
@@ -723,134 +437,58 @@ const uploadLocalVideo = async (req, res, next) => {
       throw createHttpError(403, "You can manage only your own reels");
     }
 
-    const multipartBuffer = req.file?.buffer;
     const rawBase64 =
       typeof req.body.base64Data === "string" ? req.body.base64Data : "";
-    const hasMultipartVideo = Boolean(multipartBuffer?.length);
-    const hasBase64Video = Boolean(rawBase64.trim());
-
-    if (!hasMultipartVideo && !hasBase64Video) {
-      throw createHttpError(400, "Provide multipart video file or base64Data");
+    if (!rawBase64) {
+      throw createHttpError(400, "base64Data is required");
     }
 
-    let buffer;
-    let mimeType;
-    let fileName;
+    const mimeType =
+      typeof req.body.mimeType === "string" && req.body.mimeType.trim()
+        ? req.body.mimeType.trim()
+        : "video/mp4";
+    const fileName =
+      typeof req.body.fileName === "string" && req.body.fileName.trim()
+        ? req.body.fileName.trim()
+        : "original.mp4";
 
-    if (hasMultipartVideo) {
-      buffer = multipartBuffer;
-      mimeType =
-        (typeof req.file?.mimetype === "string" && req.file.mimetype.trim()) ||
-        (typeof req.body.mimeType === "string" && req.body.mimeType.trim()) ||
-        "video/mp4";
-      fileName =
-        (typeof req.file?.originalname === "string" &&
-          req.file.originalname.trim()) ||
-        (typeof req.body.fileName === "string" && req.body.fileName.trim()) ||
-        "original.mp4";
-    } else {
-      const payload = rawBase64.includes(",")
-        ? rawBase64.slice(rawBase64.indexOf(",") + 1)
-        : rawBase64;
+    const payload = rawBase64.includes(",")
+      ? rawBase64.slice(rawBase64.indexOf(",") + 1)
+      : rawBase64;
 
-      buffer = Buffer.from(payload, "base64");
-      mimeType =
-        typeof req.body.mimeType === "string" && req.body.mimeType.trim()
-          ? req.body.mimeType.trim()
-          : "video/mp4";
-      fileName =
-        typeof req.body.fileName === "string" && req.body.fileName.trim()
-          ? req.body.fileName.trim()
-          : "original.mp4";
+    const buffer = Buffer.from(payload, "base64");
+    if (!buffer.length) {
+      throw createHttpError(400, "Invalid base64Data");
     }
-
-    if (!buffer || !buffer.length) {
-      throw createHttpError(400, "Invalid video payload");
-    }
-    if (buffer.length > REEL_UPLOAD_LIMIT_BYTES) {
+    if (buffer.length > LOCAL_REEL_UPLOAD_LIMIT_BYTES) {
       throw createHttpError(413, "Video too large. Max allowed is 40MB");
     }
 
-    if (!isCloudinaryConfigured()) {
-      throw createHttpError(
-        500,
-        "Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.",
-      );
-    }
-
-    console.log("[reels] uploading video", {
-      reelId: reel._id.toString(),
-      userId: req.user._id.toString(),
-      mimeType,
-      fileName,
-      sizeBytes: buffer.length,
-      via: hasMultipartVideo ? "multipart" : "base64",
-      target: "cloudinary",
-    });
-
-    const uploaded = await uploadVideoBufferToCloudinary({
-      buffer,
-      mimeType,
-      fileName,
+    const storageKey = buildStorageKey({
       userId: req.user._id.toString(),
       reelId: reel._id.toString(),
-    });
+      fileName,
+      mimeType,
+    }).replace(/\\/g, "/");
 
-    const publicId =
-      typeof uploaded.public_id === "string" ? uploaded.public_id.trim() : "";
-    const videoUrl =
-      typeof uploaded.secure_url === "string" && uploaded.secure_url.trim()
-        ? uploaded.secure_url.trim()
-        : "";
-    const generatedThumbUrl =
-      (Array.isArray(uploaded.eager) && uploaded.eager[0]?.secure_url) || "";
+    const absolutePath = path.join(UPLOADS_ROOT, storageKey);
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, buffer);
 
-    if (!publicId || !videoUrl) {
-      throw createHttpError(
-        500,
-        "Cloudinary upload failed to return required media metadata.",
-      );
-    }
-    const storageKey = buildStorageKeyFromPublicId(publicId);
+    const host = req.get("host");
+    const protocol = req.protocol || "http";
+    const videoUrl = `${protocol}://${host}/uploads/${storageKey}`;
 
-    reel.cloudinaryPublicId = publicId;
     reel.storageKey = storageKey;
     reel.originalUrl = videoUrl;
-    reel.playbackUrl = videoUrl;
-    if (generatedThumbUrl) {
-      reel.thumbUrl = generatedThumbUrl;
-    }
     await reel.save();
-
-    console.log("[reels] video upload success", {
-      reelId: reel._id.toString(),
-      userId: req.user._id.toString(),
-      storageKey,
-      videoUrl,
-      thumbUrl: generatedThumbUrl || "(none)",
-      target: "cloudinary",
-    });
 
     return res.status(200).json({
       storageKey,
       videoUrl,
-      reel: mapReel(reel, req.user._id.toString()),
+      reel: mapReel(reel, req.user._id.toString(), req),
     });
   } catch (error) {
-    console.error("[reels] video upload failed:", error);
-    if (
-      error?.details?.code === "CLOUDINARY_UPLOAD_TIMEOUT" ||
-      error?.details?.code === "CLOUDINARY_UPLOAD_FAILED"
-    ) {
-      return res.status(error.statusCode || 502).json({
-        message: error.message,
-        code: error.details.code,
-        details: {
-          attempts: error.details.attempts,
-          retryable: error.details.retryable,
-        },
-      });
-    }
     return next(error);
   }
 };
@@ -880,7 +518,7 @@ const markFailed = async (req, res, next) => {
     await reel.save();
 
     return res.status(200).json({
-      reel: mapReel(reel, req.user._id.toString()),
+      reel: mapReel(reel, req.user._id.toString(), req),
     });
   } catch (error) {
     return next(error);
@@ -918,7 +556,7 @@ const updateReel = async (req, res, next) => {
     await reel.save();
 
     return res.status(200).json({
-      reel: mapReel(reel, req.user._id.toString()),
+      reel: mapReel(reel, req.user._id.toString(), req),
     });
   } catch (error) {
     return next(error);
@@ -937,11 +575,8 @@ const deleteReel = async (req, res, next) => {
       throw createHttpError(403, "You can delete only your own reels");
     }
 
-    await deleteCloudinaryVideo(getCloudinaryPublicIdFromReel(reel));
-    await Promise.all([
-      ReelReport.deleteMany({ reel: reelId }),
-      Reel.deleteOne({ _id: reelId }),
-    ]);
+    await deleteNotifications({ reel: reel._id });
+    await Reel.deleteOne({ _id: reelId });
     return res.status(200).json({ message: "Reel deleted" });
   } catch (error) {
     return next(error);
@@ -952,14 +587,14 @@ const toggleLike = async (req, res, next) => {
   try {
     const { reelId } = req.params;
     const userId = req.user._id.toString();
-    const blockedIdSet = buildBlockedIdSet(req.user);
     const reel = await Reel.findById(reelId);
 
     if (!reel || reel.status !== "ready") {
       throw createHttpError(404, "Reel not found");
     }
-    if (blockedIdSet.has(reel.author.toString())) {
-      throw createHttpError(403, "Action not allowed");
+
+    if (!(await isVisibleUserId(User, reel.author))) {
+      throw createHttpError(404, "Reel not found");
     }
 
     const currentIndex = reel.likes.findIndex((id) => id.toString() === userId);
@@ -973,34 +608,34 @@ const toggleLike = async (req, res, next) => {
     reel.likesCount = reel.likes.length;
     await reel.save();
 
-    const authorId = reel.author.toString();
-    if (liked && authorId !== userId) {
-      try {
-        const reelAuthor = await User.findById(authorId).select(
-          "expoPushTokens",
-        );
-        await createUserNotification({
-          userId: authorId,
-          type: "reel_like",
-          title: `${req.user?.name || "Someone"} liked your reel`,
-          body: reel.caption
-            ? reel.caption.slice(0, 120)
-            : "Someone reacted to your reel.",
-          data: {
-            type: "reel_like",
-            reelId: reel._id.toString(),
-            actorId: userId,
-            actorName: req.user?.name || "",
-          },
-          push: {
-            enabled: true,
-            tokens: reelAuthor?.expoPushTokens || [],
-            channelId: "messages",
-          },
-        });
-      } catch (notificationError) {
-        console.warn("[reel_like] notification dispatch failed:", notificationError);
-      }
+    if (liked) {
+      await replaceNotification({
+        filter: {
+          recipient: reel.author,
+          actor: req.user._id,
+          type: "like_reel",
+          reel: reel._id,
+        },
+        recipientId: reel.author,
+        actor: req.user,
+        type: "like_reel",
+        reelId: reel._id,
+        referenceId: reel._id.toString(),
+        message: "liked your reel.",
+        deepLink: `/reels/${reel._id.toString()}`,
+        push: {
+          eventType: "like_reel",
+          title: `${req.user.name} liked your reel`,
+          body: "Tap to open the reel.",
+        },
+      });
+    } else {
+      await deleteNotifications({
+        recipient: reel.author,
+        actor: req.user._id,
+        type: "like_reel",
+        reel: reel._id,
+      });
     }
 
     return res.status(200).json({
@@ -1016,14 +651,14 @@ const toggleSave = async (req, res, next) => {
   try {
     const { reelId } = req.params;
     const userId = req.user._id.toString();
-    const blockedIdSet = buildBlockedIdSet(req.user);
     const reel = await Reel.findById(reelId);
 
     if (!reel || reel.status !== "ready") {
       throw createHttpError(404, "Reel not found");
     }
-    if (blockedIdSet.has(reel.author.toString())) {
-      throw createHttpError(403, "Action not allowed");
+
+    if (!(await isVisibleUserId(User, reel.author))) {
+      throw createHttpError(404, "Reel not found");
     }
 
     const currentIndex = reel.saves.findIndex((id) => id.toString() === userId);
@@ -1050,14 +685,14 @@ const trackView = async (req, res, next) => {
   try {
     const { reelId } = req.params;
     const userId = req.user._id.toString();
-    const blockedIdSet = buildBlockedIdSet(req.user);
     const reel = await Reel.findById(reelId);
 
     if (!reel || reel.status !== "ready") {
       throw createHttpError(404, "Reel not found");
     }
-    if (blockedIdSet.has(reel.author.toString())) {
-      throw createHttpError(403, "Action not allowed");
+
+    if (!(await isVisibleUserId(User, reel.author))) {
+      throw createHttpError(404, "Reel not found");
     }
 
     const alreadyViewed = reel.viewers.some((id) => id.toString() === userId);
@@ -1071,73 +706,6 @@ const trackView = async (req, res, next) => {
       viewed: true,
       viewsCount: reel.viewsCount || reel.viewers.length,
     });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const reportReel = async (req, res, next) => {
-  try {
-    const { reelId } = req.params;
-    const reason =
-      typeof req.body?.reason === "string" && req.body.reason.trim()
-        ? req.body.reason.trim()
-        : "other";
-    const description =
-      typeof req.body?.description === "string"
-        ? req.body.description.trim()
-        : "";
-
-    const allowedReasons = [
-      "spam",
-      "harassment",
-      "hate_speech",
-      "violence",
-      "nudity",
-      "false_information",
-      "other",
-    ];
-    if (!allowedReasons.includes(reason)) {
-      throw createHttpError(400, "Invalid report reason");
-    }
-
-    const reel = await Reel.findById(reelId).select("_id author status visibility");
-    if (!reel || reel.status !== "ready") {
-      throw createHttpError(404, "Reel not found");
-    }
-
-    const currentUserId = req.user._id.toString();
-    const friendIdSet = new Set(
-      (req.user.friends || []).map((id) => id.toString()),
-    );
-    const blockedIdSet = buildBlockedIdSet(req.user);
-    const authorId = toIdString(reel.author);
-
-    if (blockedIdSet.has(authorId)) {
-      throw createHttpError(403, "Action not allowed");
-    }
-    if (!canViewerSeeReel(reel, currentUserId, friendIdSet)) {
-      throw createHttpError(403, "You cannot report this reel");
-    }
-
-    let alreadyReported = false;
-    try {
-      await ReelReport.create({
-        reel: reel._id,
-        reporter: req.user._id,
-        owner: reel.author,
-        reason,
-        description,
-        status: "open",
-      });
-    } catch (error) {
-      if (error?.code !== 11000) throw error;
-      alreadyReported = true;
-    }
-
-    return res
-      .status(alreadyReported ? 200 : 201)
-      .json({ message: alreadyReported ? "Reel already reported" : "Reel reported" });
   } catch (error) {
     return next(error);
   }
@@ -1200,14 +768,12 @@ const seedReels = async (req, res, next) => {
 module.exports = {
   completeUpload,
   deleteReel,
+  getReel,
   initiateUpload,
-  signUpload,
   listMyReels,
-  listSavedReels,
   listReels,
   markFailed,
   markReady,
-  reportReel,
   seedReels,
   toggleLike,
   toggleSave,

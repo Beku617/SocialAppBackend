@@ -34,11 +34,28 @@ router.post(
       .optional({ values: "falsy" })
       .isMongoId()
       .withMessage("Invalid parent comment id"),
-    body("repliedToUsername")
+    body("mentions")
       .optional({ values: "falsy" })
+      .isArray({ max: 20 })
+      .withMessage("mentions must be an array"),
+    body("mentions.*.userId")
+      .optional()
+      .isMongoId()
+      .withMessage("Invalid mention user id"),
+    body("mentions.*.name")
+      .optional()
       .isString()
-      .isLength({ max: 30 })
-      .withMessage("Invalid replied-to username"),
+      .trim()
+      .isLength({ min: 1, max: 60 })
+      .withMessage("Invalid mention name"),
+    body("mentions.*.start")
+      .optional()
+      .isInt({ min: 0, max: 500 })
+      .withMessage("Invalid mention start"),
+    body("mentions.*.end")
+      .optional()
+      .isInt({ min: 1, max: 500 })
+      .withMessage("Invalid mention end"),
     validateRequest,
   ],
   addComment,
