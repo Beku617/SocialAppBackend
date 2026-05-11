@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { VISIBILITY_VALUES } = require("../utils/visibility");
 
 const storySchema = new mongoose.Schema(
   {
@@ -18,36 +19,11 @@ const storySchema = new mongoose.Schema(
       maxlength: 200,
       trim: true,
     },
-    imageFit: {
+    visibility: {
       type: String,
-      enum: ["cover", "contain"],
-      default: "cover",
-    },
-    textOverlay: {
-      text: {
-        type: String,
-        default: "",
-        maxlength: 200,
-        trim: true,
-      },
-      x: {
-        type: Number,
-        default: 0.5,
-        min: 0,
-        max: 1,
-      },
-      y: {
-        type: Number,
-        default: 0.32,
-        min: 0,
-        max: 1,
-      },
-      scale: {
-        type: Number,
-        default: 0.09,
-        min: 0.05,
-        max: 0.18,
-      },
+      enum: VISIBILITY_VALUES,
+      default: "public",
+      index: true,
     },
     viewers: [
       {
@@ -66,8 +42,7 @@ const storySchema = new mongoose.Schema(
 
 storySchema.set("toJSON", {
   transform: (_doc, ret) => {
-    ret.id =
-      ret?._id?.toString?.() || ret?.id?.toString?.() || "";
+    ret.id = ret._id.toString();
     delete ret._id;
     delete ret.__v;
     return ret;

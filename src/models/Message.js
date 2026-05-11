@@ -22,16 +22,22 @@ const messageSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    requestStatus: {
+      type: String,
+      enum: ["pending", "accepted"],
+      default: "accepted",
+      index: true,
+    },
   },
   { timestamps: true },
 );
 
 messageSchema.index({ sender: 1, receiver: 1, createdAt: -1 });
+messageSchema.index({ receiver: 1, requestStatus: 1, createdAt: -1 });
 
 messageSchema.set("toJSON", {
   transform: (_doc, ret) => {
-    ret.id =
-      ret?._id?.toString?.() || ret?.id?.toString?.() || "";
+    ret.id = ret._id.toString();
     delete ret._id;
     delete ret.__v;
     return ret;

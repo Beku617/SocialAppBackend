@@ -1,795 +1,975 @@
-const bcrypt = require("bcryptjs");
-const AdminAuditLog = require("../models/AdminAuditLog");
-const AdminNotificationCampaign = require("../models/AdminNotificationCampaign");
-const Notification = require("../models/Notification");
+const Message = require("../models/Message");
 const Post = require("../models/Post");
-const PushToken = require("../models/PushToken");
+const Report = require("../models/Report");
 const Reel = require("../models/Reel");
+const ReelReport = require("../models/ReelReport");
+const ReelComment = require("../models/ReelComment");
 const Story = require("../models/Story");
 const User = require("../models/User");
+const cloudinary = require("../config/cloudinary");
+const { env } = require("../config/env");
 const { createHttpError } = require("../utils/httpError");
-const { generateToken } = require("../utils/generateToken");
+const { createUserNotification } = require("../utils/notificationCenter");
+const { normalizeImageUrls, serializePost } = require("../utils/serializePost");
 const {
-  createAdminNotifications,
-  mapCampaign,
-} = require("../utils/adminNotifications");
-const { createAdminAuditLog, mapAdminAuditLog } = require("../utils/adminAudit");
-const {
-  getNotificationPreferenceUpdates,
-  getOrCreateNotificationPreferences,
-} = require("../utils/notificationPreferences");
-const { sendPushToUser } = require("../utils/pushNotifications");
-const { isAdminUser } = require("../utils/admin");
-const {
-  USER_ACCOUNT_STATUSES,
-  buildActiveAccountQuery,
-  getUserStatusErrorMessage,
-  isUserActive,
-} = require("../utils/userAccountStatus");
+  applyBanToUser,
+  BAN_DURATION_OPTIONS,
+  buildBanSnapshot,
+  clearUserBan,
+} = require("../utils/userAccess");
 
-const ADMIN_NOTIFICATION_CATEGORIES = [
-  "announcement",
-  "maintenance",
-  "policy",
-  "reminder",
-  "feature",
-  "direct",
+const REEL_UPLOAD_LIMIT_BYTES = 40 * 1024 * 1024;
+const ALLOWED_REEL_VISIBILITY = [
+  "public",
+  "friends",
+  "followers",
+  "private",
 ];
 
-const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-const parsePage = (value, fallback = 1) => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
-};
-
-const parseLimit = (value, fallback = 20, max = 50) => {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return fallback;
-  }
-  return Math.min(max, Math.floor(parsed));
-};
-
-const mapAdminUser = (user) => ({
+const serializeAdminUser = (user, postCount = 0) => ({
   id: user._id.toString(),
   name: user.name,
   email: user.email,
-  role: "admin",
-  accountStatus: user.accountStatus || "active",
-});
-
-const mapNotificationPreferences = (preferences) => ({
-  pushEnabled: Boolean(preferences.pushEnabled),
-  messagePushEnabled: Boolean(preferences.messagePushEnabled),
-  friendRequestPushEnabled: Boolean(preferences.friendRequestPushEnabled),
-  friendAcceptPushEnabled: Boolean(preferences.friendAcceptPushEnabled),
-  likePushEnabled: Boolean(preferences.likePushEnabled),
-  commentPushEnabled: Boolean(preferences.commentPushEnabled),
-  replyPushEnabled: Boolean(preferences.replyPushEnabled),
-  updatedAt: preferences.updatedAt,
-  updatedBy: preferences.updatedBy
-    ? {
-        id: preferences.updatedBy._id.toString(),
-        name: preferences.updatedBy.name,
-        email: preferences.updatedBy.email,
-        role:
-          preferences.updatedBy.role ||
-          (isAdminUser(preferences.updatedBy) ? "admin" : "user"),
-      }
-    : null,
-});
-
-const mapAdminUserListItem = (user) => ({
-  id: user._id.toString(),
-  name: user.name,
-  email: user.email,
-  avatarUrl: user.avatarUrl || "",
+  username: user.username || "",
   role: user.role || "user",
-  accountStatus: user.accountStatus || "active",
-  statusReason: user.statusReason || "",
-  createdAt: user.createdAt,
-  lastLoginAt: user.lastLoginAt || null,
-  followersCount:
-    user.followersCount ?? (Array.isArray(user.followers) ? user.followers.length : 0),
-  followingCount:
-    user.followingCount ?? (Array.isArray(user.following) ? user.following.length : 0),
-  friendsCount:
-    user.friendsCount ?? (Array.isArray(user.friends) ? user.friends.length : 0),
-});
-
-const mapAdminUserDetail = (user, extras = {}) => ({
-  id: user._id.toString(),
-  name: user.name,
-  email: user.email,
   avatarUrl: user.avatarUrl || "",
   bio: user.bio || "",
-  role: user.role || "user",
-  accountStatus: user.accountStatus || "active",
-  statusReason: user.statusReason || "",
-  statusUpdatedAt: user.statusUpdatedAt || null,
-  statusUpdatedBy: user.statusUpdatedBy
-    ? {
-        id: user.statusUpdatedBy._id.toString(),
-        name: user.statusUpdatedBy.name,
-        email: user.statusUpdatedBy.email,
-      }
-    : null,
   createdAt: user.createdAt,
-  updatedAt: user.updatedAt,
-  lastLoginAt: user.lastLoginAt || null,
   followersCount: Array.isArray(user.followers) ? user.followers.length : 0,
   followingCount: Array.isArray(user.following) ? user.following.length : 0,
-  friendsCount: Array.isArray(user.friends) ? user.friends.length : 0,
-  ...extras,
+  postCount,
+  ban: buildBanSnapshot(user),
+  canManage: user.role !== "admin",
 });
 
-const mapRecentUser = (user) => ({
-  id: user._id.toString(),
-  name: user.name,
-  email: user.email,
-  avatarUrl: user.avatarUrl || "",
-  role: user.role || "user",
-  accountStatus: user.accountStatus || "active",
-  createdAt: user.createdAt,
-  lastLoginAt: user.lastLoginAt || null,
-});
+const serializeAdminPost = (post) => {
+  const serialized = serializePost(post);
 
-const mapRecentNotification = (notification) => ({
-  id: notification._id.toString(),
-  type: notification.type,
-  title: notification.title || "",
-  message: notification.message,
-  category: notification.category || "activity",
-  deepLink: notification.deepLink || "",
-  isRead: Boolean(notification.isRead),
-  createdAt: notification.createdAt,
-});
-
-const mapNotificationSendResult = (result) => ({
-  campaign: result.campaign ? mapCampaign(result.campaign) : null,
-  deduplicated: Boolean(result.deduplicated),
-  queued: Boolean(result.queued),
-  requestedRecipientCount: Number(result.requestedRecipientCount || 0),
-  recipientCount: Number(result.recipientCount || 0),
-  skippedRecipientCount: Number(result.skippedRecipientCount || 0),
-  invalidRecipientCount: Number(result.invalidRecipientCount || 0),
-  inAppCreatedCount: Number(result.inAppCreatedCount || 0),
-  failedRecipientCount: Number(result.failedRecipientCount || 0),
-  pushAttemptedCount: Number(result.pushAttemptedCount || 0),
-  pushDeliveredCount: Number(result.pushDeliveredCount || 0),
-  pushSkippedCount: Number(result.pushSkippedCount || 0),
-  pushFailedCount: Number(result.pushFailedCount || 0),
-});
-
-const buildUserFilters = (query = {}) => {
-  const filters = [];
-  const trimmedQuery =
-    typeof query.q === "string" ? query.q.trim() : "";
-
-  if (trimmedQuery) {
-    const regex = new RegExp(escapeRegex(trimmedQuery), "i");
-    filters.push({ $or: [{ name: regex }, { email: regex }] });
-  }
-
-  if (query.role === "user" || query.role === "admin") {
-    filters.push({ role: query.role });
-  }
-
-  if (
-    typeof query.status === "string" &&
-    USER_ACCOUNT_STATUSES.includes(query.status)
-  ) {
-    if (query.status === "active") {
-      filters.push(buildActiveAccountQuery());
-    } else {
-      filters.push({ accountStatus: query.status });
-    }
-  }
-
-  if (query.recent === "7d" || query.recent === "30d") {
-    const days = query.recent === "7d" ? 7 : 30;
-    const sinceDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    filters.push({ createdAt: { $gte: sinceDate } });
-  }
-
-  if (!filters.length) {
-    return {};
-  }
-
-  if (filters.length === 1) {
-    return filters[0];
-  }
-
-  return { $and: filters };
+  return {
+    ...serialized,
+    status: "published",
+    caption: serialized.text,
+    likeCount: Array.isArray(serialized.likes) ? serialized.likes.length : 0,
+    commentCount: Array.isArray(serialized.comments)
+      ? serialized.comments.length
+      : 0,
+  };
 };
 
-const loginAdmin = async (req, res, next) => {
+const serializeAdminReport = (report) => ({
+  id: report._id.toString(),
+  reason: report.reason,
+  description: report.description || "",
+  status: report.status || "open",
+  createdAt: report.createdAt,
+  reporter: report.reporter
+    ? {
+        id: report.reporter._id.toString(),
+        name: report.reporter.name || "Unknown",
+        email: report.reporter.email || "",
+      }
+    : null,
+  post: report.post
+    ? {
+        id: report.post._id.toString(),
+        text: report.post.text || "",
+        imageUrl:
+          (Array.isArray(report.post.imageUrls) && report.post.imageUrls[0]) ||
+          report.post.imageUrl ||
+          "",
+        author: report.post.author
+          ? {
+              id: report.post.author._id.toString(),
+              name: report.post.author.name || "Unknown",
+            }
+          : null,
+      }
+    : null,
+});
+
+const serializeAdminReelReport = (report) => ({
+  id: report._id.toString(),
+  reason: report.reason,
+  description: report.description || "",
+  status: report.status || "open",
+  createdAt: report.createdAt,
+  reporter: report.reporter
+    ? {
+        id: report.reporter._id.toString(),
+        name: report.reporter.name || "Unknown",
+        email: report.reporter.email || "",
+      }
+    : null,
+  owner: report.owner
+    ? {
+        id: report.owner._id.toString(),
+        name: report.owner.name || "Unknown",
+        email: report.owner.email || "",
+      }
+    : null,
+  reel: report.reel
+    ? {
+        id: report.reel._id.toString(),
+        caption: report.reel.caption || "",
+        thumbUrl: report.reel.thumbUrl || "",
+        playbackUrl: report.reel.playbackUrl || "",
+        status: report.reel.status || "ready",
+        author: report.reel.author
+          ? {
+              id: report.reel.author._id.toString(),
+              name: report.reel.author.name || "Unknown",
+            }
+          : null,
+      }
+    : null,
+});
+
+const toIdString = (value) => {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (value._id) return value._id.toString();
+  return value.toString();
+};
+
+const arrayHasUser = (values, userId) =>
+  Array.isArray(values) && values.some((value) => toIdString(value) === userId);
+
+const isCloudinaryConfigured = () =>
+  Boolean(
+    env.CLOUDINARY_CLOUD_NAME &&
+      env.CLOUDINARY_API_KEY &&
+      env.CLOUDINARY_API_SECRET,
+  );
+
+const buildCloudinaryPublicId = ({ userId, reelId }) =>
+  `${userId}/${reelId}/original`;
+
+const buildStorageKeyFromPublicId = (publicId) => `cloudinary:${publicId}`;
+
+const uploadVideoBufferToCloudinary = async ({
+  buffer,
+  mimeType,
+  userId,
+  reelId,
+}) => {
+  if (!isCloudinaryConfigured()) {
+    throw createHttpError(
+      500,
+      "Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.",
+    );
+  }
+
+  const formatFromMime =
+    typeof mimeType === "string" && mimeType.includes("/")
+      ? mimeType.split("/")[1].toLowerCase()
+      : "";
+
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: "video",
+        folder: "reels",
+        public_id: buildCloudinaryPublicId({ userId, reelId }),
+        overwrite: true,
+        quality: "auto",
+        fetch_format: "auto",
+        timeout: env.REELS_UPLOAD_TIMEOUT_MS,
+        ...(formatFromMime ? { format: formatFromMime } : {}),
+        eager: [
+          {
+            format: "jpg",
+            width: 720,
+            crop: "limit",
+            start_offset: "1",
+          },
+        ],
+      },
+      (error, result) => {
+        if (error) {
+          return reject(
+            createHttpError(
+              502,
+              `Cloudinary upload failed: ${error.message || "unknown error"}`,
+            ),
+          );
+        }
+        if (!result) {
+          return reject(
+            createHttpError(502, "Cloudinary upload failed: empty response."),
+          );
+        }
+        return resolve(result);
+      },
+    );
+
+    uploadStream.end(buffer);
+  });
+};
+
+const getCloudinaryPublicIdFromReel = (reel) => {
+  if (typeof reel.cloudinaryPublicId === "string" && reel.cloudinaryPublicId.trim()) {
+    return reel.cloudinaryPublicId.trim();
+  }
+  if (typeof reel.storageKey === "string" && reel.storageKey.startsWith("cloudinary:")) {
+    return reel.storageKey.replace("cloudinary:", "").trim();
+  }
+  return "";
+};
+
+const deleteCloudinaryVideo = async (publicId) => {
+  if (!publicId || !isCloudinaryConfigured()) return;
+
   try {
-    const email =
-      typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
-    const password = typeof req.body.password === "string" ? req.body.password : "";
-
-    if (!email || !password) {
-      throw createHttpError(400, "Email and password are required");
-    }
-
-    const user = await User.findOne({ email });
-    if (!user || !isAdminUser(user)) {
-      throw createHttpError(401, "Invalid admin credentials");
-    }
-
-    const isMatch = await bcrypt.compare(password, user.passwordHash);
-    if (!isMatch) {
-      throw createHttpError(401, "Invalid admin credentials");
-    }
-
-    if (!isUserActive(user)) {
-      throw createHttpError(403, getUserStatusErrorMessage(user.accountStatus));
-    }
-
-    user.lastLoginAt = new Date();
-    await user.save();
-
-    const token = generateToken(user._id.toString());
-
-    return res.status(200).json({
-      token,
-      admin: mapAdminUser(user),
-    });
+    await cloudinary.uploader.destroy(publicId, { resource_type: "video" });
   } catch (error) {
-    return next(error);
-  }
-};
-
-const getAdminSession = async (req, res, next) => {
-  try {
-    if (!req.user || !req.isAdmin) {
-      throw createHttpError(403, "Admin access required");
-    }
-
-    return res.status(200).json({
-      admin: mapAdminUser(req.user),
+    console.warn("[admin][reels] failed to delete Cloudinary asset", {
+      publicId,
+      error: error?.message || String(error),
     });
-  } catch (error) {
-    return next(error);
   }
 };
 
-const getDashboardOverview = async (_req, res, next) => {
-  try {
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+const serializeAdminReel = (reel, currentUserId = "") => {
+  const authorId = toIdString(reel.author);
+  const storageKey = reel.storageKey || "";
 
+  return {
+    id: reel._id.toString(),
+    author: {
+      id: authorId,
+      name: reel.author?.name || "Unknown",
+      avatarUrl: reel.author?.avatarUrl || "",
+    },
+    caption: reel.caption || "",
+    music: reel.music || "",
+    storageKey,
+    originalUrl: reel.originalUrl || "",
+    playbackUrl: reel.playbackUrl || "",
+    thumbUrl: reel.thumbUrl || "",
+    duration: reel.duration || 0,
+    width: reel.width || 0,
+    height: reel.height || 0,
+    visibility: reel.visibility,
+    status: reel.status,
+    failureReason: reel.failureReason || "",
+    likesCount: Number.isFinite(reel.likesCount)
+      ? reel.likesCount
+      : reel.likes?.length || 0,
+    commentsCount: Number.isFinite(reel.commentsCount)
+      ? reel.commentsCount
+      : 0,
+    viewsCount: Number.isFinite(reel.viewsCount)
+      ? reel.viewsCount
+      : reel.viewers?.length || 0,
+    repostsCount: reel.repostsCount || 0,
+    sharesCount: reel.sharesCount || 0,
+    savesCount: Number.isFinite(reel.savesCount)
+      ? reel.savesCount
+      : reel.saves?.length || 0,
+    likedByMe: arrayHasUser(reel.likes, currentUserId),
+    savedByMe: arrayHasUser(reel.saves, currentUserId),
+    ownedByMe: authorId === currentUserId,
+    createdAt: reel.createdAt,
+    updatedAt: reel.updatedAt,
+    processedAt: reel.processedAt || null,
+  };
+};
+
+const getPostCountMap = async () => {
+  const groupedPosts = await Post.aggregate([
+    {
+      $group: {
+        _id: "$author",
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+
+  return new Map(groupedPosts.map((item) => [item._id.toString(), item.count]));
+};
+
+const getSummary = async (_req, res, next) => {
+  try {
     const [
       totalUsers,
-      activeUsers,
-      newUsersCount,
       totalPosts,
       totalReels,
-      totalStories,
-      totalCampaigns,
-      recipientStats,
-      statusBreakdown,
+      bannedUsers,
       recentUsers,
-      recentCampaigns,
-      recentlySignedInUsers,
-      recentAuditLogs,
-    ] = await Promise.all([
-      User.countDocuments({ role: "user" }),
-      User.countDocuments({
-        role: "user",
-        ...buildActiveAccountQuery(),
-      }),
-      User.countDocuments({ role: "user", createdAt: { $gte: sevenDaysAgo } }),
-      Post.countDocuments(),
-      Reel.countDocuments(),
-      Story.countDocuments(),
-      AdminNotificationCampaign.countDocuments(),
-      AdminNotificationCampaign.aggregate([
-        {
-          $group: {
-            _id: null,
-            totalRecipients: {
-              $sum: {
-                $ifNull: ["$inAppCreatedCount", "$recipientCount"],
-              },
-            },
-          },
-        },
-      ]),
-      User.aggregate([
-        { $match: { role: "user" } },
-        {
-          $group: {
-            _id: "$accountStatus",
-            count: { $sum: 1 },
-          },
-        },
-      ]),
-      User.find({ role: "user" })
-        .select("name email avatarUrl role accountStatus createdAt lastLoginAt")
-        .sort({ createdAt: -1 })
-        .limit(5)
-        .lean(),
-      AdminNotificationCampaign.find()
-        .populate("sender", "name email")
-        .sort({ createdAt: -1 })
-        .limit(5)
-        .lean(),
-      User.find({
-        role: "user",
-        lastLoginAt: { $gte: thirtyDaysAgo },
-      })
-        .select("name email avatarUrl role accountStatus createdAt lastLoginAt")
-        .sort({ lastLoginAt: -1 })
-        .limit(5)
-        .lean(),
-      AdminAuditLog.find()
-        .populate("adminUser", "name email")
-        .sort({ createdAt: -1 })
-        .limit(6)
-        .lean(),
-    ]);
+      recentPosts,
+      recentReels,
+    ] =
+      await Promise.all([
+        User.countDocuments(),
+        Post.countDocuments(),
+        Reel.countDocuments(),
+        User.countDocuments({
+          $or: [
+            { banIsPermanent: true },
+            { banExpiresAt: { $gt: new Date() } },
+          ],
+        }),
+        User.find()
+          .sort({ createdAt: -1 })
+          .limit(3)
+          .select("name role createdAt"),
+        Post.find()
+          .sort({ createdAt: -1 })
+          .limit(3)
+          .populate("author", "name")
+          .select("text createdAt author"),
+        Reel.find()
+          .sort({ createdAt: -1 })
+          .limit(3)
+          .populate("author", "name")
+          .select("caption createdAt author"),
+      ]);
 
-    const statusMap = {
-      active: 0,
-      suspended: 0,
-      banned: 0,
-      deactivated: 0,
-    };
-
-    statusBreakdown.forEach((item) => {
-      if (item?._id && Object.prototype.hasOwnProperty.call(statusMap, item._id)) {
-        statusMap[item._id] = item.count;
-      }
-    });
+    const recentActivity = [
+      ...recentUsers.map((user) => ({
+        id: `user-${user._id.toString()}`,
+        type: "user",
+        title: user.name,
+        subtitle: `Joined as ${user.role}`,
+        createdAt: user.createdAt,
+      })),
+      ...recentPosts.map((post) => ({
+        id: `post-${post._id.toString()}`,
+        type: "post",
+        title:
+          typeof post.text === "string" && post.text.trim()
+            ? post.text.trim().slice(0, 80)
+            : "Image post",
+        subtitle: `Created by ${post.author?.name || "Unknown"}`,
+        createdAt: post.createdAt,
+      })),
+      ...recentReels.map((reel) => ({
+        id: `reel-${reel._id.toString()}`,
+        type: "reel",
+        title:
+          typeof reel.caption === "string" && reel.caption.trim()
+            ? reel.caption.trim().slice(0, 80)
+            : "Video reel",
+        subtitle: `Reel by ${reel.author?.name || "Unknown"}`,
+        createdAt: reel.createdAt,
+      })),
+    ].sort(
+      (left, right) =>
+        new Date(right.createdAt).getTime() -
+        new Date(left.createdAt).getTime(),
+    );
 
     return res.status(200).json({
-      metrics: {
+      summary: {
         totalUsers,
-        activeUsers,
-        newUsersCount,
         totalPosts,
         totalReels,
-        totalStories,
-        totalAdminCampaigns: totalCampaigns,
-        totalNotificationsSent:
-          recipientStats[0]?.totalRecipients || 0,
+        bannedUsers,
+        recentActivity,
       },
-      statusBreakdown: statusMap,
-      recentSignups: recentUsers.map(mapRecentUser),
-      recentlySignedInUsers: recentlySignedInUsers.map(mapRecentUser),
-      recentCampaigns: recentCampaigns.map(mapCampaign),
-      recentAuditLogs: recentAuditLogs.map(mapAdminAuditLog),
     });
   } catch (error) {
     return next(error);
   }
 };
 
-const listUsers = async (req, res, next) => {
+const listUsers = async (_req, res, next) => {
   try {
-    const page = parsePage(req.query.page, 1);
-    const limit = parseLimit(req.query.limit, 20, 50);
-    const skip = (page - 1) * limit;
-    const filters = buildUserFilters(req.query);
-
-    const [users, totalCount] = await Promise.all([
-      User.aggregate([
-        { $match: filters },
-        { $sort: { createdAt: -1 } },
-        { $skip: skip },
-        { $limit: limit },
-        {
-          $project: {
-            name: 1,
-            email: 1,
-            avatarUrl: 1,
-            role: 1,
-            accountStatus: 1,
-            statusReason: 1,
-            createdAt: 1,
-            lastLoginAt: 1,
-            followersCount: { $size: { $ifNull: ["$followers", []] } },
-            followingCount: { $size: { $ifNull: ["$following", []] } },
-            friendsCount: { $size: { $ifNull: ["$friends", []] } },
-          },
-        },
-      ]),
-      User.countDocuments(filters),
+    const [users, postCountMap] = await Promise.all([
+      User.find().sort({ createdAt: -1 }),
+      getPostCountMap(),
     ]);
 
     return res.status(200).json({
-      users: users.map(mapAdminUserListItem),
-      page,
-      limit,
-      totalCount,
-      hasMore: skip + users.length < totalCount,
+      users: users.map((user) =>
+        serializeAdminUser(user, postCountMap.get(user._id.toString()) || 0),
+      ),
     });
   } catch (error) {
     return next(error);
   }
 };
 
-const getUserDetail = async (req, res, next) => {
+const sendAdminNotification = async (req, res, next) => {
   try {
-    const user = await User.findById(req.params.id).populate(
-      "statusUpdatedBy",
-      "name email role",
-    );
+    const title = typeof req.body.title === "string" ? req.body.title.trim() : "";
+    const body = typeof req.body.body === "string" ? req.body.body.trim() : "";
+    const allUsers = Boolean(req.body.allUsers);
+    const rawUserIds = Array.isArray(req.body.userIds)
+      ? req.body.userIds.filter((value) => typeof value === "string")
+      : [];
+    const uniqueUserIds = Array.from(new Set(rawUserIds));
 
-    if (!user) {
-      throw createHttpError(404, "User not found");
+    if (!title || !body) {
+      throw createHttpError(400, "Notification title and body are required");
     }
 
-    const [
-      postsCount,
-      reelsCount,
-      storiesCount,
-      notificationsCount,
-      unreadNotificationsCount,
-      devicesCount,
-      recentNotifications,
-    ] = await Promise.all([
-      Post.countDocuments({ author: user._id }),
-      Reel.countDocuments({ author: user._id }),
-      Story.countDocuments({ author: user._id }),
-      Notification.countDocuments({ recipient: user._id }),
-      Notification.countDocuments({ recipient: user._id, isRead: false }),
-      PushToken.countDocuments({ user: user._id, isActive: true }),
-      Notification.find({ recipient: user._id })
-        .select("type title message category deepLink isRead createdAt")
-        .sort({ createdAt: -1 })
-        .limit(5)
-        .lean(),
-    ]);
-
-    return res.status(200).json({
-      user: mapAdminUserDetail(user, {
-        postsCount,
-        reelsCount,
-        storiesCount,
-        notificationsCount,
-        unreadNotificationsCount,
-        activeDevicesCount: devicesCount,
-        recentNotifications: recentNotifications.map(mapRecentNotification),
-      }),
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const updateUserStatus = async (req, res, next) => {
-  try {
-    const nextStatus = req.body.status;
-    const reason =
-      typeof req.body.reason === "string" ? req.body.reason.trim() : "";
-
-    const user = await User.findById(req.params.id).populate(
-      "statusUpdatedBy",
-      "name email role",
-    );
-
-    if (!user) {
-      throw createHttpError(404, "User not found");
-    }
-
-    if (user._id.toString() === req.user._id.toString()) {
-      throw createHttpError(400, "You cannot change your own account status");
-    }
-
-    if (user.role === "admin") {
-      throw createHttpError(400, "Admin accounts cannot be changed here");
-    }
-
-    const previousStatus = user.accountStatus || "active";
-    const previousReason = user.statusReason || "";
-
-    if (previousStatus === nextStatus && previousReason === reason) {
-      return res.status(200).json({
-        user: mapAdminUserDetail(user),
-        message: "No status changes were required",
-      });
-    }
-
-    user.accountStatus = nextStatus;
-    user.statusReason = nextStatus === "active" ? "" : reason;
-    user.statusUpdatedAt = new Date();
-    user.statusUpdatedBy = req.user._id;
-    await user.save();
-    await user.populate("statusUpdatedBy", "name email role");
-
-    await createAdminAuditLog({
-      adminUserId: req.user._id.toString(),
-      actionType: "user_status_changed",
-      targetType: "user",
-      targetId: user._id.toString(),
-      metadata: {
-        userName: user.name,
-        userEmail: user.email,
-        previousStatus,
-        nextStatus,
-        previousReason,
-        reason: user.statusReason || "",
-      },
-    });
-
-    return res.status(200).json({
-      user: mapAdminUserDetail(user),
-      message:
-        nextStatus === "active"
-          ? "User account reactivated"
-          : `User account marked as ${nextStatus}`,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const getNotificationSettings = async (_req, res, next) => {
-  try {
-    const preferences = await getOrCreateNotificationPreferences();
-    await preferences.populate("updatedBy", "name email role");
-
-    return res.status(200).json({
-      settings: mapNotificationPreferences(preferences),
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const updateNotificationSettings = async (req, res, next) => {
-  try {
-    const updates = getNotificationPreferenceUpdates(req.body);
-    if (!Object.keys(updates).length) {
-      throw createHttpError(400, "No valid notification settings provided");
-    }
-
-    const preferences = await getOrCreateNotificationPreferences();
-    Object.assign(preferences, updates, { updatedBy: req.user._id });
-    await preferences.save();
-    await preferences.populate("updatedBy", "name email role");
-
-    return res.status(200).json({
-      settings: mapNotificationPreferences(preferences),
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const sendAdminMessagePushTest = async (req, res, next) => {
-  try {
-    const targetUserId =
-      typeof req.body.userId === "string" && req.body.userId.trim()
-        ? req.body.userId.trim()
-        : req.user._id.toString();
-
-    const targetUser = await User.findById(targetUserId).select("_id");
-    if (!targetUser) {
-      throw createHttpError(404, "Target user not found");
-    }
-
-    const result = await sendPushToUser({
-      userId: targetUser._id,
-      eventType: "admin_message",
-      title: "Admin push test",
-      body: `${req.user.name} triggered a push notification test.`,
-      data: {
-        type: "admin_message",
-        actorId: req.user._id.toString(),
-        actorName: req.user.name,
-        actorAvatarUrl: req.user.avatarUrl || "",
-        category: "maintenance",
-        deepLink: "/(dashboard)/notifications",
-        isTest: true,
-      },
-    });
-
-    await createAdminAuditLog({
-      adminUserId: req.user._id.toString(),
-      actionType: "notification_push_test",
-      targetType: "user",
-      targetId: targetUser._id.toString(),
-      metadata: {
-        delivered: result?.delivered || 0,
-        skipped: result?.skipped || "",
-      },
-    });
-
-    return res.status(200).json({
-      result,
-      message: "Test push attempt completed",
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const listNotificationHistory = async (req, res, next) => {
-  try {
-    const page = parsePage(req.query.page, 1);
-    const limit = parseLimit(req.query.limit, 20, 50);
-    const skip = (page - 1) * limit;
-
-    const [campaigns, totalCount] = await Promise.all([
-      AdminNotificationCampaign.find()
-        .populate("sender", "name email")
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      AdminNotificationCampaign.countDocuments(),
-    ]);
-
-    return res.status(200).json({
-      history: campaigns.map(mapCampaign),
-      page,
-      limit,
-      totalCount,
-      hasMore: skip + campaigns.length < totalCount,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const listAuditLogs = async (req, res, next) => {
-  try {
-    const page = parsePage(req.query.page, 1);
-    const limit = parseLimit(req.query.limit, 20, 50);
-    const skip = (page - 1) * limit;
-
-    const [entries, totalCount] = await Promise.all([
-      AdminAuditLog.find()
-        .populate("adminUser", "name email")
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      AdminAuditLog.countDocuments(),
-    ]);
-
-    return res.status(200).json({
-      auditLogs: entries.map(mapAdminAuditLog),
-      page,
-      limit,
-      totalCount,
-      hasMore: skip + entries.length < totalCount,
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const sendNotificationToSingleUser = async (req, res, next) => {
-  try {
-    const userId = req.body.userId;
-
-    const targetUser = await User.findOne({
-      _id: userId,
-      role: "user",
-      ...buildActiveAccountQuery(),
-    }).select("_id");
-
-    if (!targetUser) {
-      throw createHttpError(404, "Target user not found or is not active");
-    }
-
-    const result = await createAdminNotifications({
-      sender: req.user,
-      audienceType: "single",
-      targetUserIds: [targetUser._id.toString()],
-      title: req.body.title.trim(),
-      body: req.body.body.trim(),
-      category: req.body.category || "announcement",
-      deepLink: req.body.deepLink?.trim?.() || "",
-      sendPush: Boolean(req.body.sendPush),
-      clientRequestId: req.body.clientRequestId || "",
-    });
-
-    return res.status(201).json({
-      message: result.deduplicated
-        ? "Duplicate send prevented"
-        : "Notification sent",
-      result: mapNotificationSendResult(result),
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
-
-const sendNotificationToSelectedUsers = async (req, res, next) => {
-  try {
-    const userIds = Array.isArray(req.body.userIds) ? req.body.userIds : [];
-    if (!userIds.length) {
+    if (!allUsers && uniqueUserIds.length === 0) {
       throw createHttpError(400, "Select at least one user");
     }
 
-    const result = await createAdminNotifications({
-      sender: req.user,
-      audienceType: userIds.length === 1 ? "single" : "selected",
-      targetUserIds: userIds,
-      title: req.body.title.trim(),
-      body: req.body.body.trim(),
-      category: req.body.category || "announcement",
-      deepLink: req.body.deepLink?.trim?.() || "",
-      sendPush: Boolean(req.body.sendPush),
-      clientRequestId: req.body.clientRequestId || "",
-    });
+    const query = allUsers
+      ? {}
+      : {
+          _id: {
+            $in: uniqueUserIds,
+          },
+        };
 
-    if (!result.recipientCount) {
-      throw createHttpError(400, "No active user targets were eligible for this send");
+    const users = await User.find(query).select("_id expoPushTokens").lean();
+
+    if (!users.length) {
+      throw createHttpError(404, "No users found for this notification");
     }
 
-    return res.status(201).json({
-      message: result.deduplicated
-        ? "Duplicate send prevented"
-        : result.queued
-          ? "Notification campaign queued"
-          : "Notifications sent",
-      result: mapNotificationSendResult(result),
+    await Promise.all(
+      users.map((user) =>
+        createUserNotification({
+          userId: user._id,
+          type: "admin_broadcast",
+          title,
+          body,
+          data: {
+            type: "admin_broadcast",
+            senderId: req.user._id.toString(),
+          },
+          push: {
+            enabled: true,
+            tokens: user.expoPushTokens || [],
+            channelId: "messages",
+          },
+        }),
+      ),
+    );
+
+    return res.status(200).json({
+      message: "Notification sent successfully",
+      sentCount: users.length,
     });
   } catch (error) {
     return next(error);
   }
 };
 
-const sendNotificationToAllUsers = async (req, res, next) => {
+const getUserDetails = async (req, res, next) => {
   try {
-    if (req.body.confirmAllUsers !== true) {
+    const user = await User.findById(req.params.userId);
+    if (!user) {
+      throw createHttpError(404, "User not found");
+    }
+
+    const [postCount, recentPosts] = await Promise.all([
+      Post.countDocuments({ author: user._id }),
+      Post.find({ author: user._id })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .populate("author", "name avatarUrl")
+        .populate("comments.author", "name avatarUrl")
+        .lean(),
+    ]);
+
+    return res.status(200).json({
+      user: serializeAdminUser(user, postCount),
+      recentPosts: recentPosts.map(serializeAdminPost),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const banUser = async (req, res, next) => {
+  try {
+    const { duration } = req.body;
+    const user = await User.findById(req.params.userId);
+
+    if (!BAN_DURATION_OPTIONS.includes(duration)) {
+      throw createHttpError(400, "Invalid ban duration");
+    }
+
+    if (!user) {
+      throw createHttpError(404, "User not found");
+    }
+
+    if (user.role === "admin") {
+      throw createHttpError(403, "Admin accounts cannot be banned");
+    }
+
+    await applyBanToUser(user, duration);
+
+    return res.status(200).json({
+      message: "User banned successfully",
+      user: serializeAdminUser(
+        user,
+        await Post.countDocuments({ author: user._id }),
+      ),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const unbanUser = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.params.userId);
+    if (!user) {
+      throw createHttpError(404, "User not found");
+    }
+
+    if (user.role === "admin") {
+      throw createHttpError(403, "Admin accounts cannot be unbanned here");
+    }
+
+    await clearUserBan(user);
+
+    return res.status(200).json({
+      message: "User unbanned successfully",
+      user: serializeAdminUser(
+        user,
+        await Post.countDocuments({ author: user._id }),
+      ),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const deleteUser = async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+
+    if (req.user._id.toString() === userId) {
+      throw createHttpError(400, "You cannot delete your own admin account");
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      throw createHttpError(404, "User not found");
+    }
+
+    if (user.role === "admin") {
+      throw createHttpError(403, "Admin accounts cannot be deleted here");
+    }
+
+    await Promise.all([
+      Post.deleteMany({ author: user._id }),
+      Story.deleteMany({ author: user._id }),
+      Reel.deleteMany({ author: user._id }),
+      ReelComment.deleteMany({ author: user._id }),
+      Message.deleteMany({
+        $or: [{ sender: user._id }, { receiver: user._id }],
+      }),
+      User.updateMany(
+        {},
+        {
+          $pull: {
+            followers: user._id,
+            following: user._id,
+          },
+        },
+      ),
+      Post.updateMany(
+        {},
+        {
+          $pull: {
+            likes: user._id,
+            comments: { author: user._id },
+          },
+        },
+      ),
+      Reel.updateMany(
+        {},
+        {
+          $pull: {
+            likes: user._id,
+            saves: user._id,
+            viewers: user._id,
+          },
+        },
+      ),
+      User.deleteOne({ _id: user._id }),
+    ]);
+
+    return res.status(200).json({ message: "User deleted successfully" });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const listPosts = async (_req, res, next) => {
+  try {
+    const posts = await Post.find()
+      .sort({ createdAt: -1 })
+      .populate("author", "name avatarUrl")
+      .populate("comments.author", "name avatarUrl")
+      .lean();
+
+    return res.status(200).json({
+      posts: posts.map(serializeAdminPost),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const listReports = async (_req, res, next) => {
+  try {
+    const reports = await Report.find()
+      .sort({ createdAt: -1 })
+      .limit(400)
+      .populate("reporter", "name email")
+      .populate({
+        path: "post",
+        select: "text imageUrl imageUrls author",
+        populate: {
+          path: "author",
+          select: "name",
+        },
+      })
+      .lean();
+
+    return res.status(200).json({
+      reports: reports.map(serializeAdminReport),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const listReelReports = async (_req, res, next) => {
+  try {
+    const reports = await ReelReport.find()
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .populate("reporter", "name email")
+      .populate("owner", "name email")
+      .populate({
+        path: "reel",
+        select: "caption thumbUrl playbackUrl status author",
+        populate: {
+          path: "author",
+          select: "name",
+        },
+      })
+      .lean();
+
+    return res.status(200).json({
+      reports: reports.map(serializeAdminReelReport),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const dismissReelReport = async (req, res, next) => {
+  try {
+    const report = await ReelReport.findById(req.params.reportId);
+    if (!report) {
+      throw createHttpError(404, "Reel report not found");
+    }
+
+    report.status = "dismissed";
+    await report.save();
+
+    return res.status(200).json({
+      message: "Reel report dismissed",
+      report: {
+        id: report._id.toString(),
+        status: report.status,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const hideReelFromReport = async (req, res, next) => {
+  try {
+    const report = await ReelReport.findById(req.params.reportId).populate(
+      "reel",
+      "_id status failureReason",
+    );
+    if (!report) {
+      throw createHttpError(404, "Reel report not found");
+    }
+    if (!report.reel) {
+      throw createHttpError(404, "Reported reel not found");
+    }
+
+    report.reel.status = "failed";
+    report.reel.failureReason = "Hidden by admin after report";
+    await report.reel.save();
+
+    await ReelReport.updateMany(
+      { reel: report.reel._id, status: { $in: ["open", "reviewed", "dismissed"] } },
+      { $set: { status: "reel_hidden" } },
+    );
+
+    return res.status(200).json({
+      message: "Reel hidden successfully",
+      report: {
+        id: report._id.toString(),
+        status: "reel_hidden",
+      },
+      reel: {
+        id: report.reel._id.toString(),
+        status: report.reel.status,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getPostDetails = async (req, res, next) => {
+  try {
+    const post = await Post.findById(req.params.postId)
+      .populate("author", "name avatarUrl")
+      .populate("comments.author", "name avatarUrl")
+      .lean();
+
+    if (!post) {
+      throw createHttpError(404, "Post not found");
+    }
+
+    return res.status(200).json({
+      post: serializeAdminPost(post),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const createAdminPost = async (req, res, next) => {
+  try {
+    const text = typeof req.body.text === "string" ? req.body.text.trim() : "";
+    const imageUrls = normalizeImageUrls(req.body);
+
+    if (imageUrls.length === 0) {
+      throw createHttpError(400, "Post must include at least one image");
+    }
+
+    const post = await Post.create({
+      author: req.user._id,
+      text,
+      imageUrl: imageUrls[0] || "",
+      imageUrls,
+      likes: [],
+      comments: [],
+    });
+
+    const createdPost = await Post.findById(post._id)
+      .populate("author", "name avatarUrl")
+      .populate("comments.author", "name avatarUrl")
+      .lean();
+
+    return res.status(201).json({
+      post: serializeAdminPost(createdPost),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const deleteAdminPost = async (req, res, next) => {
+  try {
+    const post = await Post.findById(req.params.postId);
+    if (!post) {
+      throw createHttpError(404, "Post not found");
+    }
+
+    await Post.deleteOne({ _id: post._id });
+    return res.status(200).json({ message: "Post deleted successfully" });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const listReels = async (req, res, next) => {
+  try {
+    const reels = await Reel.find()
+      .sort({ createdAt: -1 })
+      .populate("author", "name avatarUrl")
+      .lean();
+
+    return res.status(200).json({
+      reels: reels.map((reel) =>
+        serializeAdminReel(reel, req.user._id.toString()),
+      ),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getReelDetails = async (req, res, next) => {
+  try {
+    const reel = await Reel.findById(req.params.reelId)
+      .populate("author", "name avatarUrl")
+      .lean();
+
+    if (!reel) {
+      throw createHttpError(404, "Reel not found");
+    }
+
+    return res.status(200).json({
+      reel: serializeAdminReel(reel, req.user._id.toString()),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const createAdminReel = async (req, res, next) => {
+  try {
+    const caption =
+      typeof req.body.caption === "string" ? req.body.caption.trim() : "";
+    const music = typeof req.body.music === "string" ? req.body.music.trim() : "";
+    const visibility =
+      typeof req.body.visibility === "string" &&
+      ALLOWED_REEL_VISIBILITY.includes(req.body.visibility)
+        ? req.body.visibility
+        : "public";
+    const thumbUrl =
+      typeof req.body.thumbUrl === "string" ? req.body.thumbUrl.trim() : "";
+    const mimeType =
+      typeof req.body.mimeType === "string" && req.body.mimeType.trim()
+        ? req.body.mimeType.trim()
+        : "video/mp4";
+    const duration = Number.isFinite(req.body.duration)
+      ? Number(req.body.duration)
+      : 0;
+    const width = Number.isFinite(req.body.width) ? Number(req.body.width) : 0;
+    const height = Number.isFinite(req.body.height) ? Number(req.body.height) : 0;
+    const rawBase64 =
+      typeof req.body.base64Data === "string" ? req.body.base64Data : "";
+
+    if (!rawBase64) {
+      throw createHttpError(400, "Video data is required");
+    }
+
+    const payload = rawBase64.includes(",")
+      ? rawBase64.slice(rawBase64.indexOf(",") + 1)
+      : rawBase64;
+    const buffer = Buffer.from(payload, "base64");
+
+    if (!buffer.length) {
+      throw createHttpError(400, "Invalid video data");
+    }
+
+    if (buffer.length > REEL_UPLOAD_LIMIT_BYTES) {
+      throw createHttpError(413, "Video too large. Max allowed is 40MB");
+    }
+    if (!isCloudinaryConfigured()) {
       throw createHttpError(
-        400,
-        "Mass send requires confirmAllUsers=true",
+        500,
+        "Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.",
       );
     }
 
-    const result = await createAdminNotifications({
-      sender: req.user,
-      audienceType: "all",
-      targetUserIds: [],
-      title: req.body.title.trim(),
-      body: req.body.body.trim(),
-      category: req.body.category || "announcement",
-      deepLink: req.body.deepLink?.trim?.() || "",
-      sendPush: Boolean(req.body.sendPush),
-      clientRequestId: req.body.clientRequestId || "",
+    const reel = await Reel.create({
+      author: req.user._id,
+      caption,
+      music,
+      visibility,
+      status: "uploading",
     });
 
-    if (!result.recipientCount) {
-      throw createHttpError(400, "No active users available to notify");
+    const uploaded = await uploadVideoBufferToCloudinary({
+      buffer,
+      mimeType,
+      userId: req.user._id.toString(),
+      reelId: reel._id.toString(),
+    });
+    const publicId =
+      typeof uploaded.public_id === "string" ? uploaded.public_id.trim() : "";
+    const videoUrl =
+      typeof uploaded.secure_url === "string" && uploaded.secure_url.trim()
+        ? uploaded.secure_url.trim()
+        : "";
+    const generatedThumbUrl =
+      (Array.isArray(uploaded.eager) && uploaded.eager[0]?.secure_url) || "";
+    if (!publicId || !videoUrl) {
+      throw createHttpError(
+        500,
+        "Cloudinary upload failed to return required media metadata.",
+      );
     }
 
+    const storageKey = buildStorageKeyFromPublicId(publicId);
+    reel.cloudinaryPublicId = publicId;
+    reel.storageKey = storageKey;
+    reel.originalUrl = videoUrl;
+    reel.playbackUrl = videoUrl;
+    reel.thumbUrl = generatedThumbUrl || thumbUrl;
+    reel.duration = duration;
+    reel.width = width;
+    reel.height = height;
+    reel.status = "ready";
+    reel.failureReason = "";
+    reel.processedAt = new Date();
+    await reel.save();
+
+    const createdReel = await Reel.findById(reel._id)
+      .populate("author", "name avatarUrl")
+      .lean();
+
     return res.status(201).json({
-      message: result.deduplicated
-        ? "Duplicate broadcast prevented"
-        : result.queued
-          ? "Broadcast queued"
-          : "Broadcast sent",
-      result: mapNotificationSendResult(result),
+      reel: serializeAdminReel(createdReel, req.user._id.toString()),
     });
   } catch (error) {
     return next(error);
   }
 };
 
+const deleteAdminReel = async (req, res, next) => {
+  try {
+    const reel = await Reel.findById(req.params.reelId);
+    if (!reel) {
+      throw createHttpError(404, "Reel not found");
+    }
+
+    await deleteCloudinaryVideo(getCloudinaryPublicIdFromReel(reel));
+
+    await Promise.all([
+      ReelComment.deleteMany({ reel: reel._id }),
+      ReelReport.deleteMany({ reel: reel._id }),
+      Reel.deleteOne({ _id: reel._id }),
+    ]);
+
+    return res.status(200).json({ message: "Reel deleted successfully" });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const blockPostEdit = async (_req, res) => {
+  return res.status(403).json({ message: "Editing posts is not allowed" });
+};
+
+const blockReelEdit = async (_req, res) => {
+  return res.status(403).json({ message: "Editing reels is not allowed" });
+};
+
 module.exports = {
-  ADMIN_NOTIFICATION_CATEGORIES,
-  getAdminSession,
-  getDashboardOverview,
-  getNotificationSettings,
-  getUserDetail,
-  listNotificationHistory,
-  listAuditLogs,
+  banUser,
+  blockPostEdit,
+  blockReelEdit,
+  createAdminPost,
+  createAdminReel,
+  deleteAdminPost,
+  deleteAdminReel,
+  deleteUser,
+  getPostDetails,
+  getReelDetails,
+  getSummary,
+  getUserDetails,
+  hideReelFromReport,
+  listPosts,
+  listReelReports,
+  listReports,
+  listReels,
   listUsers,
-  loginAdmin,
-  sendAdminMessagePushTest,
-  sendNotificationToAllUsers,
-  sendNotificationToSelectedUsers,
-  sendNotificationToSingleUser,
-  updateNotificationSettings,
-  updateUserStatus,
+  sendAdminNotification,
+  dismissReelReport,
+  unbanUser,
 };

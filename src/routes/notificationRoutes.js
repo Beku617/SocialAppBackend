@@ -1,10 +1,10 @@
 const express = require("express");
 const { param } = require("express-validator");
 const {
-  getUnreadNotificationsCount,
   listNotifications,
-  markAllNotificationsRead,
   markNotificationRead,
+  markAllNotificationsRead,
+  sendTestPush,
 } = require("../controllers/notificationController");
 const { requireAuth } = require("../middlewares/auth");
 const { validateRequest } = require("../utils/validateRequest");
@@ -12,14 +12,18 @@ const { validateRequest } = require("../utils/validateRequest");
 const router = express.Router();
 
 router.get("/", requireAuth, listNotifications);
-router.get("/unread-count", requireAuth, getUnreadNotificationsCount);
 
-router.patch("/read-all", requireAuth, markAllNotificationsRead);
+router.post("/mark-all-read", requireAuth, markAllNotificationsRead);
 
-router.patch(
-  "/:id/read",
+router.post("/test-push", requireAuth, sendTestPush);
+
+router.post(
+  "/:notificationId/read",
   requireAuth,
-  [param("id").isMongoId().withMessage("Invalid notification id"), validateRequest],
+  [
+    param("notificationId").isMongoId().withMessage("Invalid notification id"),
+    validateRequest,
+  ],
   markNotificationRead,
 );
 

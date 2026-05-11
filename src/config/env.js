@@ -3,14 +3,24 @@ const parsePort = (rawPort) => {
   return Number.isInteger(port) && port > 0 ? port : 4000;
 };
 
+const parseTimeoutMs = (rawValue, fallback) => {
+  const timeout = Number(rawValue);
+  return Number.isInteger(timeout) && timeout >= 1000 ? timeout : fallback;
+};
+
 const env = {
   PORT: parsePort(process.env.PORT),
   NODE_ENV: process.env.NODE_ENV || "development",
   MONGODB_URI: process.env.MONGODB_URI || "",
   JWT_SECRET: process.env.JWT_SECRET || "",
-  JWT_REFRESH_SECRET: process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || "",
   CLIENT_ORIGIN: process.env.CLIENT_ORIGIN || "*",
-  EXPO_ACCESS_TOKEN: process.env.EXPO_ACCESS_TOKEN || "",
+  CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME || "",
+  CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY || "",
+  CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET || "",
+  CLOUDINARY_REELS_UPLOAD_PRESET:
+    process.env.CLOUDINARY_REELS_UPLOAD_PRESET || "",
+  REELS_UPLOAD_TIMEOUT_MS: parseTimeoutMs(process.env.REELS_UPLOAD_TIMEOUT_MS, 120000),
+  SERVER_TIMEOUT_MS: parseTimeoutMs(process.env.SERVER_TIMEOUT_MS, 120000),
 };
 
 const validateEnv = () => {
@@ -18,7 +28,6 @@ const validateEnv = () => {
 
   if (!env.MONGODB_URI) missing.push("MONGODB_URI");
   if (!env.JWT_SECRET) missing.push("JWT_SECRET");
-  if (!env.JWT_REFRESH_SECRET) missing.push("JWT_REFRESH_SECRET");
 
   if (missing.length > 0) {
     throw new Error(`Missing required environment variables: ${missing.join(", ")}`);

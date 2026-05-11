@@ -1,6 +1,6 @@
 # Backend API (Express + Mongoose)
 
-## 1) Install
+## 1) Installll
 
 ```bash
 npm install
@@ -12,15 +12,10 @@ Copy `.env.example` to `.env` and fill values:
 
 - `MONGODB_URI`
 - `JWT_SECRET`
-- `EXPO_ACCESS_TOKEN` (optional, recommended for Expo Push API auth)
-- `ADMIN_SEED_EMAIL`, `ADMIN_SEED_PASSWORD` (used by admin seed script)
-- Optional: `REELS_UPLOAD_URL_TEMPLATE` (example: `https://storage.example.com/upload/{storageKey}?signature=...`)
-
-Seed first admin account:
-
-```bash
-npm run seed:admin
-```
+- Required for reel/video uploads: `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`
+- Optional for signed reel uploads: `CLOUDINARY_REELS_UPLOAD_PRESET`
+- Optional: `REELS_UPLOAD_TIMEOUT_MS` (default: `120000`)
+- Optional: `SERVER_TIMEOUT_MS` (default: `120000`)
 
 ## 3) Run
 
@@ -29,6 +24,10 @@ npm run dev
 ```
 
 Server default URL: `http://localhost:4000`
+
+Reel uploads:
+- Recommended flow is signed direct upload (`client -> Cloudinary`) using `POST /api/reels/uploads/sign`.
+- Server-side upload endpoint remains available as a fallback.
 
 ## Starter routes
 
@@ -44,19 +43,13 @@ Server default URL: `http://localhost:4000`
 - `GET /api/reels?tab=reels|friends` (Bearer token)
 - `GET /api/reels/mine` (Bearer token)
 - `POST /api/reels/uploads/initiate` (Bearer token)
-- `POST /api/reels/:reelId/uploads/local` (Bearer token, base64 upload for local storage)
-- `POST /api/reels/:reelId/uploads/complete` (Bearer token)
+- `POST /api/reels/uploads/sign` (Bearer token)
+- `POST /api/reels/:reelId/uploads/local` (Bearer token, uploads to Cloudinary)
+- `POST /api/reels/:reelId/complete` (Bearer token)
+- `POST /api/reels/:reelId/uploads/complete` (Bearer token, compatibility alias)
 - `POST /api/reels/:reelId/ready` (Bearer token)
 - `PATCH /api/reels/:reelId` (Bearer token)
 - `DELETE /api/reels/:reelId` (Bearer token)
 - `POST /api/reels/:reelId/like` (Bearer token)
 - `POST /api/reels/:reelId/save` (Bearer token)
 - `POST /api/reels/:reelId/view` (Bearer token)
-- `POST /api/push/register` (Bearer token, register Expo push token)
-- `POST /api/push/unregister` (Bearer token, deactivate token)
-- `GET /api/push/tokens` (Bearer token, list own device tokens)
-- `GET /api/admin/notification-settings` (Bearer token + admin)
-- `PATCH /api/admin/notification-settings` (Bearer token + admin)
-- `POST /api/admin/notification-settings/test-message` (Bearer token + admin)
-- `POST /api/admin/login` (admin email/password)
-- `GET /api/admin/me` (Bearer token + admin)
