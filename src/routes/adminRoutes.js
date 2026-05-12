@@ -15,6 +15,7 @@ const {
   getSummary,
   getUserDetails,
   hideReelFromReport,
+  listAdminNotifications,
   listPosts,
   listReelReports,
   listReports,
@@ -31,6 +32,7 @@ const router = express.Router();
 router.use(requireAuth, requireAdmin);
 
 router.get("/summary", getSummary);
+router.get("/notifications", listAdminNotifications);
 router.post(
   "/notifications",
   [

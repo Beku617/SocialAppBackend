@@ -1,4 +1,5 @@
 const Message = require("../models/Message");
+const Notification = require("../models/Notification");
 const Post = require("../models/Post");
 const Report = require("../models/Report");
 const Reel = require("../models/Reel");
@@ -26,6 +27,9 @@ const ALLOWED_REEL_VISIBILITY = [
   "private",
 ];
 
+const DEFAULT_ADMIN_PAGE_SIZE = 20;
+const MAX_ADMIN_PAGE_SIZE = 1000;
+
 const serializeAdminUser = (user, postCount = 0) => ({
   id: user._id.toString(),
   name: user.name,
@@ -42,17 +46,42 @@ const serializeAdminUser = (user, postCount = 0) => ({
   canManage: user.role !== "admin",
 });
 
-const serializeAdminPost = (post) => {
+const serializeAdminPost = (post, reportCount = 0) => {
   const serialized = serializePost(post);
 
   return {
     ...serialized,
-    status: "published",
+    status: reportCount > 0 ? "reported" : "visible",
     caption: serialized.text,
     likeCount: Array.isArray(serialized.likes) ? serialized.likes.length : 0,
     commentCount: Array.isArray(serialized.comments)
       ? serialized.comments.length
       : 0,
+    reportCount,
+  };
+};
+
+const serializeAdminNotification = (notification) => {
+  const deliveryType =
+    notification.data?.adminDeliveryType === "broadcast"
+      ? "broadcast"
+      : "targeted";
+
+  return {
+    id: notification._id.toString(),
+    title: notification.title || "",
+    body: notification.body || "",
+    type: deliveryType,
+    createdAt: notification.createdAt,
+    read: Boolean(notification.read),
+    target: notification.user
+      ? {
+          id: notification.user._id.toString(),
+          name: notification.user.name || "Unknown",
+          username: notification.user.username || "",
+          email: notification.user.email || "",
+        }
+      : null,
   };
 };
 
@@ -275,6 +304,107 @@ const serializeAdminReel = (reel, currentUserId = "") => {
   };
 };
 
+const getStringQuery = (value) => {
+  if (typeof value !== "string") return "";
+  return value.trim();
+};
+
+const getAllowedQuery = (value, allowedValues) => {
+  const normalized = getStringQuery(value).toLowerCase();
+  return allowedValues.includes(normalized) ? normalized : "";
+};
+
+const getPagination = (query) => {
+  const parsedPage = Number.parseInt(query.page, 10);
+  const parsedLimit = Number.parseInt(query.limit, 10);
+  const page = Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1;
+  const rawLimit =
+    Number.isFinite(parsedLimit) && parsedLimit > 0
+      ? parsedLimit
+      : DEFAULT_ADMIN_PAGE_SIZE;
+  const limit = Math.min(rawLimit, MAX_ADMIN_PAGE_SIZE);
+
+  return {
+    page,
+    limit,
+    skip: (page - 1) * limit,
+  };
+};
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const buildSearchRegex = (value) => {
+  const normalized = getStringQuery(value);
+  return normalized ? new RegExp(escapeRegex(normalized), "i") : null;
+};
+
+const getDateBoundary = (value, endOfDay = false) => {
+  const normalized = getStringQuery(value);
+  if (!normalized) return null;
+
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return null;
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    if (endOfDay) {
+      date.setHours(23, 59, 59, 999);
+    } else {
+      date.setHours(0, 0, 0, 0);
+    }
+  }
+
+  return date;
+};
+
+const getDateRange = (fromValue, toValue) => {
+  const from = getDateBoundary(fromValue);
+  const to = getDateBoundary(toValue, true);
+  const range = {};
+
+  if (from) range.$gte = from;
+  if (to) range.$lte = to;
+
+  return Object.keys(range).length > 0 ? range : null;
+};
+
+const addAndClauses = (query, clauses) => {
+  const filteredClauses = clauses.filter(Boolean);
+  if (filteredClauses.length === 0) return query;
+
+  return {
+    ...query,
+    $and: [...(Array.isArray(query.$and) ? query.$and : []), ...filteredClauses],
+  };
+};
+
+const paginateArray = (items, page, limit) => {
+  const start = (page - 1) * limit;
+  return items.slice(start, start + limit);
+};
+
+const sendPaginatedResponse = ({
+  res,
+  key,
+  items,
+  totalCount,
+  page,
+  limit,
+}) =>
+  res.status(200).json({
+    [key]: items,
+    data: items,
+    totalCount,
+    page,
+    totalPages: Math.max(1, Math.ceil(totalCount / limit)),
+    limit,
+  });
+
+const sortByDate = (direction) => (left, right) => {
+  const leftTime = new Date(left.createdAt).getTime();
+  const rightTime = new Date(right.createdAt).getTime();
+  return direction === "asc" ? leftTime - rightTime : rightTime - leftTime;
+};
+
 const getPostCountMap = async () => {
   const groupedPosts = await Post.aggregate([
     {
@@ -286,6 +416,36 @@ const getPostCountMap = async () => {
   ]);
 
   return new Map(groupedPosts.map((item) => [item._id.toString(), item.count]));
+};
+
+const getPostReportCountMap = async (postIds = []) => {
+  if (!postIds.length) return new Map();
+
+  const groupedReports = await Report.aggregate([
+    {
+      $match: {
+        post: { $in: postIds },
+      },
+    },
+    {
+      $group: {
+        _id: "$post",
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+
+  return new Map(
+    groupedReports.map((item) => [item._id.toString(), item.count]),
+  );
+};
+
+const findMatchingUserIds = async (regex) => {
+  if (!regex) return [];
+
+  return User.find({
+    $or: [{ username: regex }, { name: regex }, { email: regex }],
+  }).distinct("_id");
 };
 
 const getSummary = async (_req, res, next) => {
@@ -373,17 +533,84 @@ const getSummary = async (_req, res, next) => {
   }
 };
 
-const listUsers = async (_req, res, next) => {
+const listUsers = async (req, res, next) => {
   try {
+    const { page, limit } = getPagination(req.query);
+    const query = {};
+    const andClauses = [];
+    const searchRegex = buildSearchRegex(req.query.search);
+    const role = getAllowedQuery(req.query.role, ["user", "admin"]);
+    const status = getAllowedQuery(req.query.status, [
+      "active",
+      "banned",
+    ]);
+    const sort = getAllowedQuery(req.query.sort, [
+      "newest",
+      "oldest",
+      "most_posts",
+    ]);
+    const joinedRange = getDateRange(req.query.from, req.query.to);
+    const now = new Date();
+
+    if (searchRegex) {
+      andClauses.push({
+        $or: [
+          { username: searchRegex },
+          { name: searchRegex },
+          { email: searchRegex },
+        ],
+      });
+    }
+
+    if (role) {
+      query.role = role;
+    }
+
+    if (status === "active") {
+      andClauses.push(
+        { banIsPermanent: { $ne: true } },
+        {
+          $or: [
+            { banExpiresAt: null },
+            { banExpiresAt: { $exists: false } },
+            { banExpiresAt: { $lte: now } },
+          ],
+        },
+      );
+    } else if (status === "banned") {
+      andClauses.push({
+        $or: [{ banIsPermanent: true }, { banExpiresAt: { $gt: now } }],
+      });
+    }
+
+    if (joinedRange) {
+      query.createdAt = joinedRange;
+    }
+
+    const finalQuery = addAndClauses(query, andClauses);
     const [users, postCountMap] = await Promise.all([
-      User.find().sort({ createdAt: -1 }),
+      User.find(finalQuery).lean(),
       getPostCountMap(),
     ]);
+    const serializedUsers = users.map((user) =>
+      serializeAdminUser(user, postCountMap.get(user._id.toString()) || 0),
+    );
 
-    return res.status(200).json({
-      users: users.map((user) =>
-        serializeAdminUser(user, postCountMap.get(user._id.toString()) || 0),
-      ),
+    serializedUsers.sort((left, right) => {
+      if (sort === "oldest") return sortByDate("asc")(left, right);
+      if (sort === "most_posts") {
+        return right.postCount - left.postCount || sortByDate("desc")(left, right);
+      }
+      return sortByDate("desc")(left, right);
+    });
+
+    return sendPaginatedResponse({
+      res,
+      key: "users",
+      items: paginateArray(serializedUsers, page, limit),
+      totalCount: serializedUsers.length,
+      page,
+      limit,
     });
   } catch (error) {
     return next(error);
@@ -431,6 +658,7 @@ const sendAdminNotification = async (req, res, next) => {
           body,
           data: {
             type: "admin_broadcast",
+            adminDeliveryType: allUsers ? "broadcast" : "targeted",
             senderId: req.user._id.toString(),
           },
           push: {
@@ -445,6 +673,70 @@ const sendAdminNotification = async (req, res, next) => {
     return res.status(200).json({
       message: "Notification sent successfully",
       sentCount: users.length,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const listAdminNotifications = async (req, res, next) => {
+  try {
+    const { page, limit, skip } = getPagination(req.query);
+    const query = {
+      type: "admin_broadcast",
+    };
+    const andClauses = [];
+    const searchRegex = buildSearchRegex(req.query.search);
+    const deliveryType = getAllowedQuery(req.query.type, [
+      "broadcast",
+      "targeted",
+    ]);
+    const sentRange = getDateRange(req.query.from, req.query.to);
+
+    if (searchRegex) {
+      const targetUserIds = await findMatchingUserIds(searchRegex);
+      andClauses.push({
+        $or: [
+          { title: searchRegex },
+          { body: searchRegex },
+          { user: { $in: targetUserIds } },
+        ],
+      });
+    }
+
+    if (deliveryType === "broadcast") {
+      query["data.adminDeliveryType"] = "broadcast";
+    } else if (deliveryType === "targeted") {
+      andClauses.push({
+        $or: [
+          { "data.adminDeliveryType": "targeted" },
+          { "data.adminDeliveryType": { $exists: false } },
+        ],
+      });
+    }
+
+    if (sentRange) {
+      query.createdAt = sentRange;
+    }
+
+    const finalQuery = addAndClauses(query, andClauses);
+    const [totalCount, notifications] = await Promise.all([
+      Notification.countDocuments(finalQuery),
+      Notification.find(finalQuery)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate("user", "name username email")
+        .lean(),
+    ]);
+
+    return sendPaginatedResponse({
+      res,
+      key: "notifications",
+      items: notifications.map(serializeAdminNotification),
+      totalCount,
+      page,
+      limit,
     });
   } catch (error) {
     return next(error);
@@ -595,27 +887,135 @@ const deleteUser = async (req, res, next) => {
   }
 };
 
-const listPosts = async (_req, res, next) => {
+const listPosts = async (req, res, next) => {
   try {
-    const posts = await Post.find()
-      .sort({ createdAt: -1 })
+    const { page, limit } = getPagination(req.query);
+    const query = {};
+    const andClauses = [];
+    const searchRegex = buildSearchRegex(req.query.search);
+    const status = getAllowedQuery(req.query.status, [
+      "visible",
+      "reported",
+    ]);
+    const sort = getAllowedQuery(req.query.sort, [
+      "newest",
+      "oldest",
+      "most_liked",
+      "most_commented",
+    ]);
+    const postedRange = getDateRange(req.query.from, req.query.to);
+
+    if (searchRegex) {
+      const authorIds = await findMatchingUserIds(searchRegex);
+      andClauses.push({
+        $or: [{ text: searchRegex }, { author: { $in: authorIds } }],
+      });
+    }
+
+    if (postedRange) {
+      query.createdAt = postedRange;
+    }
+
+    if (status) {
+      const reportedPostIds = await Report.distinct("post");
+      if (status === "reported") {
+        andClauses.push({ _id: { $in: reportedPostIds } });
+      } else if (status === "visible") {
+        andClauses.push({ _id: { $nin: reportedPostIds } });
+      }
+    }
+
+    const finalQuery = addAndClauses(query, andClauses);
+    const posts = await Post.find(finalQuery)
       .populate("author", "name avatarUrl")
       .populate("comments.author", "name avatarUrl")
       .lean();
+    const reportCountMap = await getPostReportCountMap(
+      posts.map((post) => post._id),
+    );
+    const serializedPosts = posts.map((post) =>
+      serializeAdminPost(post, reportCountMap.get(post._id.toString()) || 0),
+    );
 
-    return res.status(200).json({
-      posts: posts.map(serializeAdminPost),
+    serializedPosts.sort((left, right) => {
+      if (sort === "oldest") return sortByDate("asc")(left, right);
+      if (sort === "most_liked") {
+        return right.likeCount - left.likeCount || sortByDate("desc")(left, right);
+      }
+      if (sort === "most_commented") {
+        return (
+          right.commentCount - left.commentCount ||
+          sortByDate("desc")(left, right)
+        );
+      }
+      return sortByDate("desc")(left, right);
+    });
+
+    return sendPaginatedResponse({
+      res,
+      key: "posts",
+      items: paginateArray(serializedPosts, page, limit),
+      totalCount: serializedPosts.length,
+      page,
+      limit,
     });
   } catch (error) {
     return next(error);
   }
 };
 
-const listReports = async (_req, res, next) => {
+const listReports = async (req, res, next) => {
   try {
-    const reports = await Report.find()
-      .sort({ createdAt: -1 })
-      .limit(400)
+    const { page, limit, skip } = getPagination(req.query);
+    const query = {};
+    const andClauses = [];
+    const searchRegex = buildSearchRegex(req.query.search);
+    const status = getAllowedQuery(req.query.status, [
+      "pending",
+      "open",
+      "reviewed",
+    ]);
+    const reason = getAllowedQuery(req.query.reason, [
+      "spam",
+      "nudity",
+      "harassment",
+      "hate_speech",
+      "violence",
+      "false_information",
+      "other",
+    ]);
+    const sort = getAllowedQuery(req.query.sort, ["newest", "oldest"]);
+    const reportedRange = getDateRange(req.query.from, req.query.to);
+
+    if (searchRegex) {
+      const [reporterIds, postIds] = await Promise.all([
+        findMatchingUserIds(searchRegex),
+        Post.find({ text: searchRegex }).distinct("_id"),
+      ]);
+      andClauses.push({
+        $or: [{ reporter: { $in: reporterIds } }, { post: { $in: postIds } }],
+      });
+    }
+
+    if (status) {
+      query.status = status === "pending" ? "open" : status;
+    }
+
+    if (reason) {
+      query.reason = reason;
+    }
+
+    if (reportedRange) {
+      query.createdAt = reportedRange;
+    }
+
+    const finalQuery = addAndClauses(query, andClauses);
+    const [totalCount, reports] = await Promise.all([
+      Report.countDocuments(finalQuery),
+      Report.find(finalQuery)
+        .sort({ createdAt: sort === "oldest" ? 1 : -1 })
+        .skip(skip)
+        .limit(limit)
       .populate("reporter", "name email")
       .populate({
         path: "post",
@@ -625,35 +1025,100 @@ const listReports = async (_req, res, next) => {
           select: "name",
         },
       })
-      .lean();
+        .lean(),
+    ]);
 
-    return res.status(200).json({
-      reports: reports.map(serializeAdminReport),
+    return sendPaginatedResponse({
+      res,
+      key: "reports",
+      items: reports.map(serializeAdminReport),
+      totalCount,
+      page,
+      limit,
     });
   } catch (error) {
     return next(error);
   }
 };
 
-const listReelReports = async (_req, res, next) => {
+const listReelReports = async (req, res, next) => {
   try {
-    const reports = await ReelReport.find()
-      .sort({ createdAt: -1 })
-      .limit(500)
-      .populate("reporter", "name email")
-      .populate("owner", "name email")
-      .populate({
-        path: "reel",
-        select: "caption thumbUrl playbackUrl status author",
-        populate: {
-          path: "author",
-          select: "name",
-        },
-      })
-      .lean();
+    const { page, limit, skip } = getPagination(req.query);
+    const query = {};
+    const andClauses = [];
+    const searchRegex = buildSearchRegex(req.query.search);
+    const status = getAllowedQuery(req.query.status, [
+      "pending",
+      "open",
+      "reviewed",
+      "dismissed",
+      "reel_hidden",
+    ]);
+    const reason = getAllowedQuery(req.query.reason, [
+      "spam",
+      "nudity",
+      "harassment",
+      "hate_speech",
+      "violence",
+      "false_information",
+      "other",
+    ]);
+    const sort = getAllowedQuery(req.query.sort, ["newest", "oldest"]);
+    const reportedRange = getDateRange(req.query.from, req.query.to);
 
-    return res.status(200).json({
-      reports: reports.map(serializeAdminReelReport),
+    if (searchRegex) {
+      const [userIds, reelIds] = await Promise.all([
+        findMatchingUserIds(searchRegex),
+        Reel.find({ caption: searchRegex }).distinct("_id"),
+      ]);
+      andClauses.push({
+        $or: [
+          { reporter: { $in: userIds } },
+          { owner: { $in: userIds } },
+          { reel: { $in: reelIds } },
+        ],
+      });
+    }
+
+    if (status) {
+      query.status = status === "pending" ? "open" : status;
+    }
+
+    if (reason) {
+      query.reason = reason;
+    }
+
+    if (reportedRange) {
+      query.createdAt = reportedRange;
+    }
+
+    const finalQuery = addAndClauses(query, andClauses);
+    const [totalCount, reports] = await Promise.all([
+      ReelReport.countDocuments(finalQuery),
+      ReelReport.find(finalQuery)
+        .sort({ createdAt: sort === "oldest" ? 1 : -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate("reporter", "name email")
+        .populate("owner", "name email")
+        .populate({
+          path: "reel",
+          select: "caption thumbUrl playbackUrl status author",
+          populate: {
+            path: "author",
+            select: "name",
+          },
+        })
+        .lean(),
+    ]);
+
+    return sendPaginatedResponse({
+      res,
+      key: "reports",
+      items: reports.map(serializeAdminReelReport),
+      totalCount,
+      page,
+      limit,
     });
   } catch (error) {
     return next(error);
@@ -786,15 +1251,69 @@ const deleteAdminPost = async (req, res, next) => {
 
 const listReels = async (req, res, next) => {
   try {
-    const reels = await Reel.find()
-      .sort({ createdAt: -1 })
+    const { page, limit } = getPagination(req.query);
+    const query = {};
+    const andClauses = [];
+    const searchRegex = buildSearchRegex(req.query.search);
+    const status = getAllowedQuery(req.query.status, [
+      "visible",
+      "reported",
+    ]);
+    const sort = getAllowedQuery(req.query.sort, [
+      "newest",
+      "oldest",
+      "most_viewed",
+      "most_liked",
+    ]);
+    const postedRange = getDateRange(req.query.from, req.query.to);
+
+    if (searchRegex) {
+      const authorIds = await findMatchingUserIds(searchRegex);
+      andClauses.push({
+        $or: [{ caption: searchRegex }, { author: { $in: authorIds } }],
+      });
+    }
+
+    if (postedRange) {
+      query.createdAt = postedRange;
+    }
+
+    if (status) {
+      const reportedReelIds = await ReelReport.distinct("reel");
+      if (status === "reported") {
+        andClauses.push({ _id: { $in: reportedReelIds } });
+      } else if (status === "visible") {
+        query.status = "ready";
+        andClauses.push({ _id: { $nin: reportedReelIds } });
+      }
+    }
+
+    const finalQuery = addAndClauses(query, andClauses);
+    const reels = await Reel.find(finalQuery)
       .populate("author", "name avatarUrl")
       .lean();
+    const serializedReels = reels.map((reel) =>
+      serializeAdminReel(reel, req.user._id.toString()),
+    );
 
-    return res.status(200).json({
-      reels: reels.map((reel) =>
-        serializeAdminReel(reel, req.user._id.toString()),
-      ),
+    serializedReels.sort((left, right) => {
+      if (sort === "oldest") return sortByDate("asc")(left, right);
+      if (sort === "most_viewed") {
+        return right.viewsCount - left.viewsCount || sortByDate("desc")(left, right);
+      }
+      if (sort === "most_liked") {
+        return right.likesCount - left.likesCount || sortByDate("desc")(left, right);
+      }
+      return sortByDate("desc")(left, right);
+    });
+
+    return sendPaginatedResponse({
+      res,
+      key: "reels",
+      items: paginateArray(serializedReels, page, limit),
+      totalCount: serializedReels.length,
+      page,
+      limit,
     });
   } catch (error) {
     return next(error);
@@ -964,6 +1483,7 @@ module.exports = {
   getSummary,
   getUserDetails,
   hideReelFromReport,
+  listAdminNotifications,
   listPosts,
   listReelReports,
   listReports,
